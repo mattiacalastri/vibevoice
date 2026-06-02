@@ -1,0 +1,4 @@
+pyobjc
+mlx-whisper
+sounddevice
+numpy
