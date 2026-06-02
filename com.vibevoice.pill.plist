@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  VibeVoice — MIT
+  LaunchAgent template for the VibeVoice pill (Dynamic Island UI).
+
+  Replace __HOME__ with the absolute path to your home directory
+  (e.g. /Users/yourname) before installing. See README "Auto-start".
+
+  Install:
+    cp com.vibevoice.pill.plist ~/Library/LaunchAgents/
+    # edit the copy and replace __HOME__
+    launchctl load ~/Library/LaunchAgents/com.vibevoice.pill.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vibevoice.pill</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__HOME__/projects/vibevoice/vibevoice.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.vibevoice/pill.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.vibevoice/pill.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VIBEVOICE_LANG</key>
+        <string>en</string>
+        <key>VIBEVOICE_AUTOSEND</key>
+        <string>1</string>
+        <key>VIBEVOICE_AUTOSEND_RETURN</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
