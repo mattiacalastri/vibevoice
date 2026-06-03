@@ -44,6 +44,9 @@ stop talking).
 - **Immediate onset** — the pill reacts the instant you start speaking; silence makes it disappear.
 - **Universal autosend (CGEvent)** — pastes into *any* frontmost app via synthetic
   keyboard events, no app-specific integration required.
+- **One-shot auto-Return daemon** — an optional `autosend.py` that presses Return
+  for you after dictation settles. Armed with `Cmd+Shift+Space`, fires once, then
+  disarms itself — with window-level locking so it never fires into the wrong window.
 - **Inline copy (⧉)** — one tap copies the last transcription to the clipboard.
 - **Menu bar toggle** — a 🎙 menu bar item flips dictation on/off at any time.
 - **Hides on silence** — the island stays out of your way until you speak again.
@@ -52,7 +55,8 @@ stop talking).
 
 - **macOS 12+** (a Mac with a notch is recommended — that's where the island lives).
 - **Python 3.10+**
-- Python packages: **PyObjC**, **mlx-whisper**, **sounddevice**, **numpy**.
+- Python packages: **PyObjC**, **mlx-whisper**, **sounddevice**, **numpy**
+  (plus **pynput** if you use the optional `autosend.py` daemon).
 - System permissions:
   - **Microphone** access (System Settings → Privacy & Security → Microphone).
   - **Accessibility** access for synthetic keystrokes / autosend
@@ -84,16 +88,32 @@ python3 vibevoice.py &
 
 ## Architecture
 
-VibeVoice is split into **two fully decoupled processes** that communicate only
-through a small set of files under `~/.vibevoice/`:
+VibeVoice is split into **decoupled processes** that communicate only through a
+small set of files under `~/.vibevoice/`:
 
 - **`engine.py`** — captures the microphone, runs STT, and **writes** the state files.
 - **`vibevoice.py`** — the pill / Dynamic Island UI. It **reads** the state files
   and draws the waveform, transcription, and controls.
+- **`autosend.py`** *(optional)* — a standalone daemon that presses Return after
+  you stop typing/dictating. It shares nothing with the engine except the
+  optional pause flag, so you can run it with any STT (or not at all).
 
 Because the only contract between them is the state directory, you can
 **bring your own engine**: swap `engine.py` for anything that respects the
 contract below, and the pill keeps working unchanged.
+
+### Two ways to fire the prompt
+
+Pressing Return after the text lands has two independent paths — use whichever
+fits:
+
+1. **Engine-driven (simple).** Set `VIBEVOICE_AUTOSEND_RETURN=1` and the engine
+   presses Return right after it pastes. Zero extra processes.
+2. **Daemon-driven (`autosend.py`, robust).** A global keystroke listener that
+   fires Return only after typing goes quiet, **armed one-shot** via
+   `Cmd+Shift+Space`, with window-signature locking so a delayed Return can't
+   land in a window you switched to. Best when you dictate into a terminal/editor
+   and want a hard guarantee the Return won't misfire.
 
 ### State-file contract (shared pill ↔ engine)
 
@@ -108,6 +128,32 @@ exactly.
   (write to a temp file, then `os.replace`).
 - **`~/.vibevoice/raw.txt`** — the last transcription as **plain text**
   (just the sentence — no logs, no timestamps).
+- **`~/.vibevoice/autosend`** *(written by `autosend.py` only)* — `on` | `off`,
+  the armed state of the auto-Return daemon. Independent of the pill/engine.
+
+### Auto-send daemon (`autosend.py`)
+
+Optional, standalone. It listens to global keystrokes (`pynput`) and, while a
+target app is frontmost, presses Return once typing has been quiet for
+`--delay` seconds (default `0.8`).
+
+- **Arm / disarm:** `Cmd+Shift+Space` — *tink* = armed, *submarine* = disarmed,
+  plus a desktop notification when armed.
+- **One-shot:** after the first Return fires it disarms itself, so it never
+  presses Return while you type by hand afterwards.
+- **Window lock:** it snapshots the frontmost window and skips the send if you
+  switched windows during the silence window.
+- **External pause:** write a unix timestamp into `/tmp/vibevoice_autosend_pause`
+  to suspend it (auto-clears after 60s); delete the file to resume.
+
+```bash
+pip install pynput
+python3 autosend.py            # then arm with Cmd+Shift+Space and dictate
+python3 autosend.py --delay 3  # wait 3s of silence before pressing Return
+```
+
+Needs **Accessibility** permission for the app that launches it (it reads global
+keys and simulates Return).
 
 ## Auto-start (LaunchAgent)
 
@@ -122,6 +168,15 @@ directory path** (e.g. `/Users/yourname`) before installing:
 cp com.vibevoice.pill.plist ~/Library/LaunchAgents/
 # edit the copy: replace every __HOME__ with your home path
 launchctl load ~/Library/LaunchAgents/com.vibevoice.pill.plist
+```
+
+To also auto-start the one-shot auto-Return daemon, install
+**[`com.vibevoice.autosend.plist`](com.vibevoice.autosend.plist)** the same way:
+
+```bash
+cp com.vibevoice.autosend.plist ~/Library/LaunchAgents/
+# edit the copy: replace every __HOME__ with your home path
+launchctl load ~/Library/LaunchAgents/com.vibevoice.autosend.plist
 ```
 
 ## Configuration
