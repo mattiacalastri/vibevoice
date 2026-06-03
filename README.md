@@ -1,15 +1,27 @@
-# VibeVoice
+<h1 align="center">VibeVoice</h1>
 
-> A Matrix-green Dynamic Island for your voice — live STT + autosend for macOS, built for Claude Code live-coding.
+<p align="center">
+  <strong>A Matrix-green Dynamic Island for your voice.</strong><br>
+  Live speech-to-text in your Mac's notch — dictate, and your words land where the cursor is.
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+<p align="center">
+  <img src="docs/hero.png" alt="VibeVoice — the live waveform pill in the notch, showing a transcription" width="640">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple" alt="macOS 12+">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/STT-whisper--turbo-9cf" alt="whisper-turbo">
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome">
+</p>
 
 ---
 
 ## Table of Contents
 
 - [What it is](#what-it-is)
-- [Demo](#demo)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Install](#install)
@@ -17,6 +29,10 @@
 - [Architecture](#architecture)
 - [Auto-start (LaunchAgent)](#auto-start-launchagent)
 - [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [FAQ](#faq)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
 - [License](#license)
 - [Credits](#credits)
 
@@ -33,10 +49,6 @@ It's purpose-built for **live coding with Claude Code**: keep your hands on the
 keyboard, dictate the next instruction, and let VibeVoice drop it straight into
 the terminal (with an optional auto-Return so the prompt fires the moment you
 stop talking).
-
-## Demo
-
-![demo](docs/demo.gif)
 
 ## Features
 
@@ -65,7 +77,7 @@ stop talking).
 ## Install
 
 ```bash
-git clone https://github.com/your-username/vibevoice.git
+git clone https://github.com/mattiacalastri/vibevoice.git
 cd vibevoice
 pip install -r requirements.txt
 
@@ -75,6 +87,11 @@ python3 engine.py &
 # Start the pill (Dynamic Island UI, reads state files)
 python3 vibevoice.py &
 ```
+
+> **First run:** macOS will prompt for **Microphone** and **Accessibility**
+> permissions. Grant both to the app you launch from (Terminal, iTerm2, etc.) —
+> see [Troubleshooting](#troubleshooting) if the pill stays invisible or text
+> doesn't paste.
 
 ## Usage
 
@@ -87,6 +104,24 @@ python3 vibevoice.py &
    toggle dictation on/off.
 
 ## Architecture
+
+```
+   🎤 mic
+    │
+    ▼
+┌─────────────┐   writes    ┌──────────────────┐   reads    ┌──────────────┐
+│  engine.py  │ ──────────▶ │  ~/.vibevoice/   │ ◀───────── │ vibevoice.py │
+│  capture +  │   state     │  state · levels  │   state    │  the pill /  │
+│  whisper    │   files     │  raw.txt         │   files    │  Dynamic Is. │
+└─────────────┘             └──────────────────┘            └──────────────┘
+       │                                                            │
+       │ paste text into frontmost app                              │ draws
+       ▼                                                            ▼
+┌──────────────────────────────────┐                         📺 the notch
+│  autosend.py  (optional daemon)  │  presses Return after typing settles
+│  Cmd+Shift+Space · one-shot      │  — armed, fires once, disarms itself
+└──────────────────────────────────┘
+```
 
 VibeVoice is split into **decoupled processes** that communicate only through a
 small set of files under `~/.vibevoice/`:
@@ -181,13 +216,70 @@ launchctl load ~/Library/LaunchAgents/com.vibevoice.autosend.plist
 
 ## Configuration
 
-Behavior is controlled by environment variables:
+Behavior is controlled by environment variables read by `engine.py`:
 
-| Variable                     | Default | Description                                                        |
-| ---------------------------- | ------- | ------------------------------------------------------------------ |
-| `VIBEVOICE_LANG`             | `en`    | Whisper transcription language code (e.g. `en`, `it`).             |
-| `VIBEVOICE_AUTOSEND`         | `1`     | `1` to auto-paste into the frontmost app, `0` to copy only.        |
-| `VIBEVOICE_AUTOSEND_RETURN`  | `1`     | `1` to press Return after pasting (fires the prompt), `0` to skip. |
+| Variable                     | Default                          | Description                                                        |
+| ---------------------------- | -------------------------------- | ------------------------------------------------------------------ |
+| `VIBEVOICE_LANG`             | `it`                             | Whisper transcription language code (e.g. `en`, `it`, `de`, `fr`). |
+| `VIBEVOICE_MODEL`            | `mlx-community/whisper-turbo`    | The `mlx_whisper` model to load.                                   |
+| `VIBEVOICE_AUTOSEND`         | `1`                              | `1` to auto-paste into the frontmost app, `0` to copy only.        |
+| `VIBEVOICE_AUTOSEND_RETURN`  | `0`                              | `1` to press Return right after pasting (fires the prompt), `0` to skip. |
+
+```bash
+# Example: English, copy-to-clipboard only, no auto-Return
+VIBEVOICE_LANG=en VIBEVOICE_AUTOSEND=0 python3 engine.py
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+| ------- | --- |
+| **Pill never appears** | The engine isn't running or lacks **Microphone** access. Check `python3 engine.py` output and System Settings → Privacy & Security → Microphone. |
+| **Transcription works but text doesn't paste** | Missing **Accessibility** permission for the launching app. Add Terminal/iTerm2 under Privacy & Security → Accessibility, then restart it. |
+| **Auto-Return fires into the wrong window** | Use the `autosend.py` daemon instead of `VIBEVOICE_AUTOSEND_RETURN` — it locks onto the window you dictated into. |
+| **`autosend.py` does nothing when I dictate** | It's one-shot: arm it first with **`Cmd+Shift+Space`** (you'll hear *tink* + a notification). It disarms after one send. |
+| **Wrong language transcribed** | Set `VIBEVOICE_LANG` (default is `it`). |
+| **`ModuleNotFoundError: pynput`** | `pip install pynput` — only needed for the optional `autosend.py` daemon. |
+
+## FAQ
+
+**Do I need a Mac with a notch?**
+No — the pill renders under the notch area, but it works on any macOS 12+ display. A notch just makes it feel native.
+
+**Does it send my audio anywhere?**
+No. Transcription runs **locally** via `mlx-whisper` on Apple Silicon. Nothing leaves your machine.
+
+**Can I use a different STT engine?**
+Yes. The pill only reads the [state-file contract](#state-file-contract-shared-pill--engine). Swap `engine.py` for anything that writes those files.
+
+**Is it only for Claude Code?**
+No. It pastes into *any* frontmost app — terminal, editor, chat box, browser field. Claude Code is just the workflow it was born for.
+
+## Roadmap
+
+This is **v0.x** — it works end to end (capture → transcribe → paste → send). Planned:
+
+- [ ] Packaged `.app` bundle (no manual `pip` / LaunchAgent editing)
+- [ ] Configurable theme (beyond Matrix green)
+- [ ] In-pill language switcher
+- [ ] Demo GIF + short screencast
+- [ ] Optional streaming partial transcripts
+
+Ideas and PRs welcome — see [Contributing](#contributing).
+
+## Contributing
+
+Contributions are welcome. Open an issue to discuss a change, or send a PR:
+
+```bash
+git clone https://github.com/mattiacalastri/vibevoice.git
+cd vibevoice
+pip install -r requirements.txt
+# make your change, test engine.py + vibevoice.py + autosend.py, then open a PR
+```
+
+Keep the **state-file contract** stable — it's the seam that lets people bring
+their own engine. If you change it, document it in the same PR.
 
 ## License
 
