@@ -95,7 +95,7 @@ LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
 VAD_THRESHOLD = 0.015   # RMS above this starts/sustains "recording"
 SILENCE_SEC = 1.5       # trailing silence that ends an utterance
 MIN_DUR = 0.4           # discard utterances shorter than this (seconds)
-MAX_DUR = 30.0          # force finalize after this many seconds
+MAX_DUR = 15.0          # force finalize after this many seconds (short enough to keep each blob within the recognizer's comfort window + sustain rhythm on long dictation)
 PRE_ROLL_BLOCKS = 5     # blocks of audio kept before speech onset
 
 RETURN_DELAY = 1.5      # seconds between paste and Return keypress
@@ -287,7 +287,7 @@ class Engine:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._busy = threading.Semaphore(1)  # one transcription at a time
+        self._busy = threading.Semaphore(2)  # up to two transcriptions in flight — keeps the tail of a long utterance from being dropped while the previous blob is still transcribing
 
         # VAD / capture state (guarded by _lock).
         self._speaking = False
@@ -408,7 +408,7 @@ class Engine:
             write_levels(self._rms_history)
             return
 
-        # Only one transcription in flight; if busy, drop this utterance.
+        # Up to two transcriptions in flight; if both slots are busy, drop this utterance.
         if self._busy.acquire(blocking=False):
             threading.Thread(
                 target=self._transcribe_worker, args=(audio,), daemon=True
