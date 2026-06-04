@@ -14,3 +14,7 @@ select = ["E4", "E7", "E9", "F"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# The engine/pill/autosend modules live at the repo root (flat layout, not a
+# package). Put the root on sys.path so `import engine` resolves under a bare
+# `pytest` invocation — not just `python -m pytest`, which adds the CWD itself.
+pythonpath = ["."]
