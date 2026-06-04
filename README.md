@@ -137,6 +137,11 @@ Because the only contract between them is the state directory, you can
 **bring your own engine**: swap `engine.py` for anything that respects the
 contract below, and the pill keeps working unchanged.
 
+> **Going deeper / editing the code?** See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+> for the threading model, VAD state machine, render loop, and tunable constants.
+> Working with an AI agent? Point it at **[AGENTS.md](AGENTS.md)** — it lists the
+> invariants that must not be broken.
+
 ### Two ways to fire the prompt
 
 Pressing Return after the text lands has two independent paths — use whichever
@@ -280,6 +285,10 @@ pip install -r requirements.txt
 
 Keep the **state-file contract** stable — it's the seam that lets people bring
 their own engine. If you change it, document it in the same PR.
+
+Before you start, read **[AGENTS.md](AGENTS.md)** (engineering contract +
+invariants) and **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (how the runtime
+fits together). These also brief any AI coding agent you point at the repo.
 
 ## License
 
