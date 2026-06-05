@@ -7,6 +7,33 @@ file is the engineering contract underneath it.)
 
 ---
 
+## 0. Repo layout
+
+```
+vibevoice/
+├── engine.py                     # capture → VAD → Whisper → paste (sole writer of state files)
+├── vibevoice.py                  # the pill UI + menu-bar master switch (reads state files)
+├── autosend.py                   # standalone one-shot auto-Return daemon (pynput)
+├── CLAUDE.md                     # short agent rules → points here
+├── AGENTS.md                     # this file: the engineering contract
+├── README.md                     # human-facing intro, install, troubleshooting
+├── requirements.txt              # pyobjc, mlx-whisper, sounddevice, numpy
+├── pyproject.toml                # ruff + pytest config (no [project]: it's an app, not a package)
+├── LICENSE                       # MIT
+├── com.vibevoice.pill.plist      # LaunchAgent template for the pill   (replace __HOME__)
+├── com.vibevoice.autosend.plist  # LaunchAgent template for autosend   (replace __HOME__)
+├── docs/
+│   └── ARCHITECTURE.md           # deep runtime reference (threads, VAD, geometry, constants)
+├── tests/
+│   └── test_contract.py          # headless contract tests (no mic/GUI/model)
+└── .github/workflows/ci.yml      # macOS CI: ruff check + pytest
+```
+
+Runtime files (created at run time, **not** in the repo) live under `~/.vibevoice/`
+— see §2. Tests must never touch them; they redirect to `tmp_path`.
+
+---
+
 ## 1. What this is
 
 VibeVoice is a macOS speech-to-text utility with a "Dynamic Island" UI. You speak,
@@ -132,6 +159,11 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_AUTOSEND` | `1` | paste transcription into frontmost app |
 | `VIBEVOICE_AUTOSEND_RETURN` | `0` | press Return after pasting |
 
+### Environment variables (pill)
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `VIBEVOICE_ENGINE_AUTOSTART` | `0` | Read by `vibevoice.py` (not the engine). `1` makes the pill spawn `engine.py` on launch — the all-in-one path so one LaunchAgent runs the whole stack. Gated so the default (manual 🎙 toggle) is unchanged; spawned in the pill's GUI/TCC context so the mic permission resolves. Set to `1` in `com.vibevoice.pill.plist`. |
+
 ### macOS permissions (changes here are usually permission problems, not code bugs)
 - **Microphone** → `engine.py` (System Settings ▸ Privacy & Security ▸ Microphone).
 - **Accessibility** → `autosend.py` (pynput global listener + synthetic keys) and the
@@ -176,3 +208,57 @@ available and keep it green. Match the existing comment density — the code fav
 | Menu-bar master switch, engine start/stop | `vibevoice.py` → `_engine_running`, `_start_engine`, `_stop_engine` |
 | Auto-Return timing, target-app gating, one-shot logic | `autosend.py` → `AutoSendDaemon` |
 | Deeper data-flow / threading model | `docs/ARCHITECTURE.md` |
+
+---
+
+## 8. Commit & PR conventions
+
+- **Conventional commits.** Prefix with `feat:`, `fix:`, `docs:`, `test:`,
+  `refactor:`, `chore:` (+ optional scope, e.g. `fix(engine): …`). Match the
+  existing history (`git log --oneline`).
+- **Keep CI green.** Every push/PR runs `ruff check .` + `pytest` on macOS. Run
+  both locally first; do not commit red.
+- **Contract changes are atomic.** Any change to a `~/.vibevoice/` file format
+  must update the writer *and every reader* in the **same commit** (see §2).
+  Add or update a contract test in `tests/test_contract.py` to lock the new shape.
+- **One concern per commit.** UI tweaks, engine/VAD changes, and autosend changes
+  are independent surfaces — keep them in separate commits.
+- **Definition of done** (before you open a PR):
+  1. `ruff check .` clean · 2. `pytest` green · 3. contract writer+readers in
+  sync · 4. you exercised the touched path behaviorally (§6) · 5. docs updated
+  if you changed an invariant, constant, or the file map.
+
+---
+
+## 9. Known sharp edges (intentional — do not "fix" blindly)
+
+These are deliberate trade-offs, documented so an agent doesn't "repair" them
+into a regression. Improve them only with a design that preserves the invariants
+in §3 — and update this section if you do.
+
+1. **Broad process match for start/stop.** The pill uses `pgrep -f engine.py` /
+   `pkill -f engine.py` (§3 invariant #8). This matches *any* process whose
+   command line contains `engine.py`, so it cannot distinguish two instances and
+   could touch an unrelated `engine.py`. It is the simplest reliable supervisor
+   for the single-user, single-instance design. If you make it PID-tracked,
+   preserve start / stop / "is it running" and keep the filename contract intact.
+2. **Clipboard is overwritten, not restored.** `engine.autosend()` `pbcopy`s the
+   transcription and pastes it; the user's previous clipboard is lost. Restoring
+   it is possible but races with fast successive dictations — left simple on
+   purpose. Don't add a naive save/restore without handling overlap.
+3. **Two transcriptions may finish out of order.** `Semaphore(2)` (invariant #4)
+   keeps the tail of a long monologue from being dropped, but if two blobs are in
+   flight the second can complete first, pasting text slightly out of order. This
+   is an accepted trade vs. dropping audio. Do **not** revert to `Semaphore(1)` to
+   "fix ordering" — that reintroduces the dropped-monologue bug (commit `9e6ee0e`).
+   A correct fix would sequence *paste* order while keeping concurrent transcribe.
+4. **Exceptions are swallowed widely** (`except Exception: pass` / writes to
+   `stderr`). This is required for the realtime audio callback (#3) and keeps the
+   daemons crash-proof, but it hides systematic failures. When debugging, add
+   temporary logging — don't make the swallow conditional in a way that can let
+   the audio callback raise.
+5. **`autosend.py` spawns `osascript` per keystroke.** `get_frontmost_signature()`
+   shells out to AppleScript on the listener thread while you type in a target
+   app. It's fine in practice but is the place to look for input latency or
+   process churn; any optimization must keep the window-signature check (it's
+   what prevents a Return firing into a window you switched away from).
