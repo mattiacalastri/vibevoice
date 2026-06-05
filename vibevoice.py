@@ -315,6 +315,13 @@ class Controller(NSObject):
         self.t0 = time.time()
         self._build_window()
         self._build_menubar()
+        # Optional: come up already dictating when launchd-managed. Gated by env so
+        # the default (manual 🎙 toggle) is unchanged. The engine is spawned here in
+        # the pill's GUI/TCC context, where the mic permission resolves correctly.
+        if (not self.demo and not self.place
+                and os.environ.get("VIBEVOICE_ENGINE_AUTOSTART") == "1"
+                and not _engine_running()):
+            _start_engine()
         return self
 
     def _build_window(self):

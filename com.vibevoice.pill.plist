@@ -37,6 +37,13 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- All-in-one: the pill spawns engine.py itself, inside its own GUI/TCC
+             context where the microphone permission resolves. Loading THIS one
+             agent brings up the full capture -> transcribe -> paste stack — no
+             separate engine LaunchAgent needed. Set to 0 (or remove this key) to
+             keep the engine off until you flip the menu-bar toggle. -->
+        <key>VIBEVOICE_ENGINE_AUTOSTART</key>
+        <string>1</string>
         <key>VIBEVOICE_LANG</key>
         <string>en</string>
         <key>VIBEVOICE_AUTOSEND</key>
