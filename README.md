@@ -76,6 +76,29 @@ stop talking).
 
 ## Install
 
+### Option A — build the app (recommended, all-in-one)
+
+Assemble a double-clickable `VibeVoice.app` and launch it. The bundle carries its
+own identity, so the **Microphone** and **Accessibility** prompts attach to
+*VibeVoice* (not to your Terminal), and one double-click brings up the whole
+capture → transcribe → paste stack.
+
+```bash
+git clone https://github.com/mattiacalastri/vibevoice.git
+cd vibevoice
+pip3 install -r requirements.txt   # interpreter deps (the .app reuses your python3)
+./build_app.sh                     # -> dist/VibeVoice.app
+open dist/VibeVoice.app            # first launch prompts for Microphone + Accessibility
+```
+
+> The bundle is **lightweight**: it ships the source + a launcher + an
+> `Info.plist`, and runs the first `python3` it finds that has the deps. It does
+> not embed Python, so it's small and reliable but **not signed/notarized** —
+> perfect for your own Mac; for distribution to others, sign + notarize it (or
+> wrap it with py2app/PyInstaller).
+
+### Option B — run the scripts directly (dev)
+
 ```bash
 git clone https://github.com/mattiacalastri/vibevoice.git
 cd vibevoice
@@ -272,7 +295,8 @@ No. It pastes into *any* frontmost app — terminal, editor, chat box, browser f
 
 This is **v0.x** — it works end to end (capture → transcribe → paste → send). Planned:
 
-- [ ] Packaged `.app` bundle (no manual `pip` / LaunchAgent editing)
+- [x] Packaged `.app` bundle (`./build_app.sh` — double-click, own mic identity, no LaunchAgent editing)
+- [ ] Self-contained signed/notarized bundle (embed Python via py2app/PyInstaller)
 - [ ] Configurable theme (beyond Matrix green)
 - [ ] In-pill language switcher
 - [ ] Demo GIF + short screencast
