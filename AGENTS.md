@@ -14,6 +14,7 @@ vibevoice/
 ├── engine.py                     # capture → VAD → Whisper → paste (sole writer of state files)
 ├── vibevoice.py                  # the pill UI + menu-bar master switch (reads state files)
 ├── autosend.py                   # standalone one-shot auto-Return daemon (pynput)
+├── build_app.sh                  # assembles a double-clickable VibeVoice.app (own TCC identity) -> dist/
 ├── CLAUDE.md                     # short agent rules → points here
 ├── AGENTS.md                     # this file: the engineering contract
 ├── README.md                     # human-facing intro, install, troubleshooting
@@ -25,7 +26,8 @@ vibevoice/
 ├── docs/
 │   └── ARCHITECTURE.md           # deep runtime reference (threads, VAD, geometry, constants)
 ├── tests/
-│   └── test_contract.py          # headless contract tests (no mic/GUI/model)
+│   ├── test_contract.py          # headless contract tests (no mic/GUI/model)
+│   └── test_app_bundle.py        # headless: builds VibeVoice.app, locks its shape
 └── .github/workflows/ci.yml      # macOS CI: ruff check + pytest
 ```
 
@@ -208,6 +210,7 @@ available and keep it green. Match the existing comment density — the code fav
 | Menu-bar master switch, engine start/stop | `vibevoice.py` → `_engine_running`, `_start_engine`, `_stop_engine` |
 | Auto-Return timing, target-app gating, one-shot logic | `autosend.py` → `AutoSendDaemon` |
 | Deeper data-flow / threading model | `docs/ARCHITECTURE.md` |
+| `.app` bundle layout, Info.plist identity, mic/AppleEvents usage strings | `build_app.sh` (locked by `tests/test_app_bundle.py`) |
 
 ---
 
