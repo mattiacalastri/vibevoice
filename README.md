@@ -201,6 +201,13 @@ A LaunchAgent template is included as **[`com.vibevoice.pill.plist`](com.vibevoi
 (`RunAtLoad` + `KeepAlive`). It runs `python3 ~/projects/vibevoice/vibevoice.py`
 on login and keeps it alive.
 
+**All-in-one:** the template sets `VIBEVOICE_ENGINE_AUTOSTART=1`, so the pill
+spawns `engine.py` itself (in its own GUI/TCC context, where the mic permission
+resolves) — loading this **single** agent brings up the whole capture →
+transcribe → paste stack. You don't need a separate engine LaunchAgent. Set that
+key to `0` (or remove it) if you'd rather flip the engine on with the 🎙 menu-bar
+toggle.
+
 The template uses a `__HOME__` placeholder — **replace it with your absolute home
 directory path** (e.g. `/Users/yourname`) before installing:
 
@@ -229,6 +236,7 @@ Behavior is controlled by environment variables read by `engine.py`:
 | `VIBEVOICE_MODEL`            | `mlx-community/whisper-turbo`    | The `mlx_whisper` model to load.                                   |
 | `VIBEVOICE_AUTOSEND`         | `1`                              | `1` to auto-paste into the frontmost app, `0` to copy only.        |
 | `VIBEVOICE_AUTOSEND_RETURN`  | `0`                              | `1` to press Return right after pasting (fires the prompt), `0` to skip. |
+| `VIBEVOICE_ENGINE_AUTOSTART` | `0`                              | Read by the **pill**, not the engine. `1` makes `vibevoice.py` spawn `engine.py` on launch (all-in-one — one LaunchAgent runs the whole stack); `0` waits for the 🎙 menu-bar toggle. The bundled `com.vibevoice.pill.plist` sets this to `1`. |
 
 ```bash
 # Example: English, copy-to-clipboard only, no auto-Return
