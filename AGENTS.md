@@ -76,6 +76,13 @@ own `autosend` flag.
 | `~/.vibevoice/raw.txt` | last transcription, plain text (the sentence only) | engine | pill |
 | `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py | autosend.py |
 | `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock) | external tools | autosend.py |
+| `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
+| `~/.vibevoice/locked` | presence = pill stays visible (no auto-hide) | pill | pill |
+
+The last two are **control files**, not engine-owned state: the pill writes them and
+the engine (or the pill itself) honors them — the same external-control pattern as the
+autosend pause flag. They do not violate invariant #1 (which governs `state` /
+`levels.bin` / `raw.txt`).
 
 If you change this contract, you must change **both** the writer and every reader in
 the same commit. The `60` in `levels.bin` is duplicated as `LEVELS_LEN` (engine) and a

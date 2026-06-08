@@ -42,9 +42,17 @@ STATE-FILE CONTRACT (shared pill <-> engine, under ~/.vibevoice/):
 
 The engine WRITES these files; the pill READS them.
 
+CONTROL FILES (this pill WRITES them; the engine / this pill honor them — the
+same external-control pattern as autosend's pause flag, NOT engine-owned state):
+  ~/.vibevoice/muted       presence = mic paused (engine ignores audio, stays alive)
+  ~/.vibevoice/locked      presence = pill stays visible (no auto-hide)
+
 Menu bar icon (🎙/🔇) is always present and acts as the master switch:
   - click toggles the engine (launches/kills engine.py via subprocess)
+  - "🔇 Mute mic" pauses the mic without killing the engine
+  - "🔒 Keep pill visible" pins the pill so it never auto-hides
   - "Quit" stops everything
+The pill also draws clickable 🔇 (red) and 🔒 (amber) icons next to the ✕.
 
 Run:
   python3 vibevoice.py            # live (reads the engine state files)
@@ -84,6 +92,29 @@ STATE_DIR  = Path(os.path.expanduser("~/.vibevoice"))
 STATE_FILE = STATE_DIR / "state"        # idle | recording | transcribing
 LEVELS_BIN = STATE_DIR / "levels.bin"   # 60 float32 LE (RMS 0..1)
 RAW_TXT    = STATE_DIR / "raw.txt"       # last transcription (plain text)
+# control files (the pill writes these; not engine-owned state):
+MUTED_FILE  = STATE_DIR / "muted"        # presence = mic paused (engine reads, stays alive)
+LOCKED_FILE = STATE_DIR / "locked"       # presence = pill stays visible (pill-only, no auto-hide)
+
+
+def _flag_on(path) -> bool:
+    """True if a control flag file exists (defensive: never raises)."""
+    try:
+        return path.exists()
+    except Exception:
+        return False
+
+
+def _toggle_flag(path) -> None:
+    """Create the flag if absent, remove it if present. Errors are swallowed."""
+    try:
+        if path.exists():
+            path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+    except Exception:
+        pass
 
 # engine.py lives next to this file
 ENGINE_PATH = Path(os.path.abspath(__file__)).parent / "engine.py"
@@ -101,6 +132,8 @@ IDLE_HIDE_S = 1.5            # seconds of silence before fade-out
 TICK        = 1.0 / 24.0     # ~24 fps
 
 MATRIX = (0.12, 1.00, 0.32)  # Matrix-terminal flúor green (#1fff52)
+MUTE_RED   = (1.00, 0.27, 0.23)   # 🔇 active (mic paused)
+LOCK_AMBER = (1.00, 0.74, 0.20)   # 🔒 active (pill pinned visible)
 
 _CTRL  = None   # strong refs (avoid GC of controller/timer)
 _TIMER = None
@@ -146,7 +179,13 @@ class PillView(NSView):
         self.copied_flash = 0.0
         self.hover_x = False
         self.hover_c = False
+        self.hover_m = False        # hover over 🔇 mute icon
+        self.hover_l = False        # hover over 🔒 lock icon
+        self.muted = False          # mic paused (red)
+        self.locked = False         # pill pinned visible (amber)
         self.copy_rect = None
+        self.mute_rect = None       # click target for mute
+        self.lock_rect = None       # click target for lock
         return self
 
     # ── click on the ✕ (top-right) → stop engine; ⧉ (inline) → copy sentence ──
@@ -157,6 +196,20 @@ class PillView(NSView):
         # ✕ STOP (top-right) → kills the engine, pill stays as a service
         if loc.x >= w - 40.0 and loc.y >= h - 34.0:
             _stop_engine()
+            return
+        # 🔇 MUTE (left of the ✕) → pause the mic without killing the engine
+        mr = self.mute_rect
+        if mr and mr[0] <= loc.x <= mr[0] + mr[2] and mr[1] <= loc.y <= mr[1] + mr[3]:
+            _toggle_flag(MUTED_FILE)
+            self.muted = _flag_on(MUTED_FILE)
+            self.setNeedsDisplay_(True)
+            return
+        # 🔒 LOCK (between mute and ✕) → keep the pill visible (no auto-hide)
+        lr = self.lock_rect
+        if lr and lr[0] <= loc.x <= lr[0] + lr[2] and lr[1] <= loc.y <= lr[1] + lr[3]:
+            _toggle_flag(LOCKED_FILE)
+            self.locked = _flag_on(LOCKED_FILE)
+            self.setNeedsDisplay_(True)
             return
         # ⧉ COPY inline (at the end of the text) → re-copy last sentence
         cr = self.copy_rect
@@ -178,6 +231,8 @@ class PillView(NSView):
     def drawRect_(self, rect):
         b = self.bounds()
         hf = b.size.height
+        self.mute_rect = None     # cleared each frame; re-set below when drawn
+        self.lock_rect = None
         # ── pure-BLACK background (extension of the notch) ──
         w, h = b.size.width, b.size.height
         bg = _pill_path(w, h, PILL_RADIUS)   # square top, rounded bottom
@@ -272,6 +327,43 @@ class PillView(NSView):
         xq.lineToPoint_(NSMakePoint(cxc - s / 2, qy + s))
         xq.setLineWidth_(1.6)
         xq.stroke()
+
+        # ── 🔒 LOCK (left of the ✕): padlock — amber when pinned visible ──
+        cx_l = w - 52.0
+        lc = LOCK_AMBER if self.locked else (MATRIX if self.hover_l else WHITE)
+        la = 0.95 if (self.locked or self.hover_l) else 0.62
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(lc[0], lc[1], lc[2], la).set()
+        body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(cx_l - 5.0, qy, 10.0, 8.0), 1.5, 1.5)
+        shackle = NSBezierPath.bezierPath()
+        shackle.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_(
+            NSMakePoint(cx_l, qy + 8.0), 3.0, 0.0, 180.0)
+        shackle.setLineWidth_(1.4)
+        if self.locked:
+            body.fill()
+        else:
+            body.setLineWidth_(1.4)
+            body.stroke()
+        shackle.stroke()
+        self.lock_rect = (cx_l - 9.0, qy - 3.0, 20.0, 20.0)
+
+        # ── 🔇 MUTE (left of the lock): circle+slash — red when mic paused ──
+        cx_m = w - 78.0
+        cym = qy + 4.0
+        mc = MUTE_RED if self.muted else (MATRIX if self.hover_m else WHITE)
+        ma = 0.95 if (self.muted or self.hover_m) else 0.62
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(mc[0], mc[1], mc[2], ma).set()
+        circ = NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(cx_m - 6.0, cym - 6.0, 12.0, 12.0))
+        circ.setLineWidth_(1.4)
+        circ.stroke()
+        if self.muted:
+            sl = NSBezierPath.bezierPath()
+            sl.moveToPoint_(NSMakePoint(cx_m - 4.2, cym - 4.2))
+            sl.lineToPoint_(NSMakePoint(cx_m + 4.2, cym + 4.2))
+            sl.setLineWidth_(1.6)
+            sl.stroke()
+        self.mute_rect = (cx_m - 9.0, qy - 3.0, 20.0, 20.0)
 
 
 def _engine_running():
@@ -388,6 +480,14 @@ class Controller(NSObject):
             "Voice: …", "toggleVoice:", "")
         self.mb_toggle.setTarget_(self)
         menu.addItem_(self.mb_toggle)
+        self.mb_mute = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "🔇 Mute mic", "toggleMute:", "")
+        self.mb_mute.setTarget_(self)
+        menu.addItem_(self.mb_mute)
+        self.mb_lock = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "🔒 Keep pill visible", "toggleLock:", "")
+        self.mb_lock.setTarget_(self)
+        menu.addItem_(self.mb_lock)
         menu.addItem_(NSMenuItem.separatorItem())
         qi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit", "quitAll:", "")
@@ -395,6 +495,8 @@ class Controller(NSObject):
         menu.addItem_(qi)
         self.status_item.setMenu_(menu)
         self._mb_last = None
+        self._mb_mute_last = None
+        self._mb_lock_last = None
 
     def _mic_is_on(self):
         return _engine_running()
@@ -404,6 +506,15 @@ class Controller(NSObject):
             _stop_engine()
         else:
             _start_engine()
+
+    def toggleMute_(self, sender):
+        # 🔇 pause/resume the mic without killing the engine (the engine reads
+        # the `muted` control file and ignores audio while it exists).
+        _toggle_flag(MUTED_FILE)
+
+    def toggleLock_(self, sender):
+        # 🔒 pin the pill visible / release it back to auto-hide.
+        _toggle_flag(LOCKED_FILE)
 
     def quitAll_(self, sender):
         _stop_engine()
@@ -497,6 +608,16 @@ class Controller(NSObject):
             active = (time.time() - self.last_voice) <= hold
             text = text_now if active else ""
 
+        # control flags (mute / lock) — read once per tick.
+        muted = _flag_on(MUTED_FILE)
+        locked = _flag_on(LOCKED_FILE)
+        # 🔒 lock pins the pill visible regardless of silence (not in demo/place,
+        # which force-show anyway).
+        if locked and not (self.demo or self.place):
+            active = True
+        self.view.muted = muted
+        self.view.locked = locked
+
         # show/hide transition → native AppKit animation (fade + slide from the notch),
         # triggered ONCE on state change. The waveform updates every tick.
         if active != self.last_active:
@@ -511,6 +632,12 @@ class Controller(NSObject):
             cr = self.view.copy_rect
             self.view.hover_c = bool(cr and cr[0] <= mloc.x <= cr[0] + cr[2]
                                      and cr[1] <= mloc.y <= cr[1] + cr[3])
+            mr = self.view.mute_rect
+            self.view.hover_m = bool(mr and mr[0] <= mloc.x <= mr[0] + mr[2]
+                                     and mr[1] <= mloc.y <= mr[1] + mr[3])
+            lr = self.view.lock_rect
+            self.view.hover_l = bool(lr and lr[0] <= mloc.x <= lr[0] + lr[2]
+                                     and lr[1] <= mloc.y <= lr[1] + lr[3])
         except Exception:
             pass
         self.view.setLevels_text_active_(levels, text, active)
@@ -521,6 +648,13 @@ class Controller(NSObject):
             self.status_item.button().setTitle_("🎙" if on else "🔇")
             self.mb_toggle.setTitle_("● Voice on — click to stop" if on
                                      else "○ Voice off — click to start")
+        # menu titles for mute/lock reflect the live flag state
+        if muted != self._mb_mute_last:
+            self._mb_mute_last = muted
+            self.mb_mute.setTitle_("🔊 Unmute mic" if muted else "🔇 Mute mic")
+        if locked != self._mb_lock_last:
+            self._mb_lock_last = locked
+            self.mb_lock.setTitle_("🔓 Release pill" if locked else "🔒 Keep pill visible")
 
 
 def main():
