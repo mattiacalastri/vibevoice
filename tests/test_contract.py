@@ -37,6 +37,7 @@ def engine_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "LEVELS_TMP", tmp_path / "levels.tmp")
     monkeypatch.setattr(engine, "STATE_FILE", tmp_path / "state")
     monkeypatch.setattr(engine, "RAW_FILE", tmp_path / "raw.txt")
+    monkeypatch.setattr(engine, "MUTED_FILE", tmp_path / "muted")
     return tmp_path
 
 
@@ -98,6 +99,37 @@ def test_state_roundtrip(engine_state):
 def test_raw_roundtrip(engine_state):
     engine.write_raw("apri la dashboard")
     assert engine.RAW_FILE.read_text() == "apri la dashboard"
+
+
+# ── mute control file: pill writes, engine reads (pause-not-kill contract) ─────
+
+def test_is_muted_reflects_flag_file(engine_state):
+    """`is_muted()` mirrors the presence of the muted control file."""
+    assert engine.is_muted() is False
+    engine.MUTED_FILE.touch()
+    assert engine.is_muted() is True
+    engine.MUTED_FILE.unlink()
+    assert engine.is_muted() is False
+
+
+def test_muted_engine_ignores_microphone(engine_state):
+    """While muted, a loud block must NOT start recording — the mic is paused."""
+    eng = engine.Engine()
+    engine.MUTED_FILE.touch()
+    loud = np.full((engine.BLOCKSIZE, 1), 0.5, dtype=np.float32)  # well above VAD
+    eng._audio_callback(loud, engine.BLOCKSIZE, None, None)
+    assert eng._speaking is False
+    assert engine.STATE_FILE.read_text() == "idle"
+
+
+def test_unmuted_engine_starts_recording_on_speech(engine_state):
+    """Without the mute flag, the same loud block starts an utterance — guards
+    that the mute gate does not break the normal capture path."""
+    eng = engine.Engine()
+    loud = np.full((engine.BLOCKSIZE, 1), 0.5, dtype=np.float32)
+    eng._audio_callback(loud, engine.BLOCKSIZE, None, None)
+    assert eng._speaking is True
+    assert engine.STATE_FILE.read_text() == "recording"
 
 
 # ── WAV encoding for Whisper (16 kHz / 16-bit / mono) ─────────────────────────

@@ -39,6 +39,11 @@
 #                            written atomically (tmp + os.replace)
 #   ~/.vibevoice/raw.txt     last transcription, plain text (sentence only)
 #
+# CONTROL FILES (written by the pill / external tools, read by the engine — the
+# same external-control pattern as autosend's pause flag, NOT engine-owned state):
+#   ~/.vibevoice/muted       presence = mic paused: the engine stays alive but
+#                            ignores the microphone (no recording/transcription)
+#
 # Environment variables:
 #   VIBEVOICE_LANG            transcription language code (default: "it")
 #   VIBEVOICE_MODEL           mlx_whisper model (default: mlx-community/whisper-turbo)
@@ -77,6 +82,7 @@ STATE_FILE = STATE_DIR / "state"        # idle | recording | transcribing
 LEVELS_FILE = STATE_DIR / "levels.bin"  # 60 float32 LE, RMS 0..1
 LEVELS_TMP = STATE_DIR / "levels.tmp"   # staging for atomic replace
 RAW_FILE = STATE_DIR / "raw.txt"        # last transcription, plain text
+MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -135,6 +141,20 @@ def write_raw(text: str) -> None:
         RAW_FILE.write_text(text)
     except Exception:
         pass
+
+
+def is_muted() -> bool:
+    """Return True while the mute control file is present.
+
+    Unlike the three state files above (which the engine owns), `muted` is
+    written by the pill's master switch and read here — the same external-control
+    pattern as autosend's pause flag. When muted, the engine keeps running but
+    ignores the microphone: a pause, not a kill (no TCC re-grant on the way back).
+    """
+    try:
+        return MUTED_FILE.exists()
+    except Exception:
+        return False
 
 
 # ── Transcription (mlx_whisper) ───────────────────────────────────────────────
@@ -289,6 +309,9 @@ class Engine:
         self._stop = threading.Event()
         self._busy = threading.Semaphore(2)  # up to two transcriptions in flight — keeps the tail of a long utterance from being dropped while the previous blob is still transcribing
 
+        # Mute edge-detector: write "idle" once when entering mute, not per block.
+        self._was_muted = False
+
         # VAD / capture state (guarded by _lock).
         self._speaking = False
         self._buf: list[np.ndarray] = []
@@ -341,6 +364,21 @@ class Engine:
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         """Called by sounddevice for each audio block. Runs the VAD."""
         try:
+            # Mute gate (a deliberate pause from the pill). Checked outside the
+            # lock, before any work: ignore the mic but keep the engine alive.
+            # Cheap stat per block; the whole callback already swallows errors.
+            if is_muted():
+                if not self._was_muted:
+                    self._was_muted = True
+                    with self._lock:
+                        # Drop any in-flight utterance cleanly.
+                        self._speaking = False
+                        self._t_silence = None
+                        self._buf = []
+                    write_state("idle")
+                return
+            self._was_muted = False
+
             block = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
             rms = float(np.sqrt(np.mean(block ** 2))) if block.size else 0.0
             now = time.monotonic()
