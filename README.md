@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/mattiacalastri/vibevoice/actions/workflows/ci.yml"><img src="https://github.com/mattiacalastri/vibevoice/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple" alt="macOS 12+">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white" alt="Python 3.10+">
@@ -22,6 +23,7 @@
 ## Table of Contents
 
 - [What it is](#what-it-is)
+- [Built for vibe coding](#built-for-vibe-coding)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Install](#install)
@@ -50,6 +52,25 @@ keyboard, dictate the next instruction, and let VibeVoice drop it straight into
 the terminal (with an optional auto-Return so the prompt fires the moment you
 stop talking).
 
+<p align="center">
+  <img src="docs/sequence.svg" alt="VibeVoice end to end: speak, VAD onset, record, silence, whisper, paste, optional Return" width="760">
+</p>
+
+## Built for vibe coding
+
+[Vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) — the term Andrej
+Karpathy coined in early 2025 — is the flow where you describe what you want in
+plain language and let an AI agent (Claude Code, Cursor, Copilot) write the code.
+The bottleneck stops being syntax and becomes **how fast you can express intent**.
+
+Typing is the friction. VibeVoice removes it: keep your hands resting, *talk* to
+your agent, and your instruction lands in the terminal the instant you stop — with
+an optional auto-Return that fires the prompt for you. It's the missing input
+device for vibe coding: **think out loud, ship.**
+
+> Born for **Claude Code**, but it pastes into *any* frontmost app — editor, chat
+> box, browser field. See [Two ways to fire the prompt](#two-ways-to-fire-the-prompt).
+
 ## Features
 
 - **Matrix pixel waveform** — a live, retro-green RMS waveform rendered in the notch.
@@ -61,6 +82,11 @@ stop talking).
   disarms itself — with window-level locking so it never fires into the wrong window.
 - **Inline copy (⧉)** — one tap copies the last transcription to the clipboard.
 - **Menu bar toggle** — a 🎙 menu bar item flips dictation on/off at any time.
+- **🔇 Mute (pause, not kill)** — tap the mute icon (or the menu bar) to pause the
+  mic without tearing down the engine, so resuming never re-prompts for the
+  microphone permission.
+- **🔒 Lock (pin visible)** — keep the pill on screen instead of auto-hiding on
+  silence — handy while positioning it or watching levels.
 - **Hides on silence** — the island stays out of your way until you speak again.
 
 ## Requirements
@@ -126,7 +152,29 @@ python3 vibevoice.py &
 5. **✕ / menu bar** — dismiss the pill with ✕, or use the **🎙** menu bar item to
    toggle dictation on/off.
 
+### Preview the design (no mic, no engine)
+
+Two flags let you see and position the pill on its own — handy for screenshots or
+to nudge it under your notch:
+
+```bash
+python3 vibevoice.py --demo     # animated demo: canned text + synthetic waveform (ignores the mic)
+python3 vibevoice.py --place    # placement mode: the pill stays visible so you can position it
+```
+
+<p align="center">
+  <img src="docs/demo_pill.png" alt="VibeVoice pill in --demo mode: Matrix-green pixel waveform, transcribed line, inline copy glyph" width="540">
+</p>
+<p align="center"><sub>The pill in <code>--demo</code> mode — a fixed sample line, not live dictation.</sub></p>
+
 ## Architecture
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="VibeVoice data flow: mic into engine.py; engine writes state files under ~/.vibevoice; the pill reads them and draws under the notch; engine pastes into the frontmost app; an optional autosend daemon presses Return" width="780">
+</p>
+
+<details>
+<summary><sub>Same diagram in plain text</sub></summary>
 
 ```
    🎤 mic
@@ -146,6 +194,8 @@ python3 vibevoice.py &
 └──────────────────────────────────┘
 ```
 
+</details>
+
 VibeVoice is split into **decoupled processes** that communicate only through a
 small set of files under `~/.vibevoice/`:
 
@@ -164,6 +214,16 @@ contract below, and the pill keeps working unchanged.
 > for the threading model, VAD state machine, render loop, and tunable constants.
 > Working with an AI agent? Point it at **[AGENTS.md](AGENTS.md)** — it lists the
 > invariants that must not be broken.
+
+### Engine states
+
+The engine is a small state machine driven by an energy-based voice activity
+detector (VAD). It writes the current state to `~/.vibevoice/state` on every
+transition; the pill reads it to decide when to appear, animate, and fade.
+
+<p align="center">
+  <img src="docs/state-machine.svg" alt="Engine state machine: idle to recording on voice onset (RMS >= 0.015), recording to transcribing after 1.5s silence or 15s max, then back to idle once the text is pasted" width="780">
+</p>
 
 ### Two ways to fire the prompt
 
