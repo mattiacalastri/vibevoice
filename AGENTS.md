@@ -74,15 +74,25 @@ own `autosend` flag.
 | `~/.vibevoice/state` | text: `idle` \| `recording` \| `transcribing` | engine | pill |
 | `~/.vibevoice/levels.bin` | **exactly 60 × float32 little-endian**, RMS 0..1, written atomically (`tmp` + `os.replace`) | engine | pill |
 | `~/.vibevoice/raw.txt` | last transcription, plain text (the sentence only) | engine | pill |
-| `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py | autosend.py |
+| `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py, pill | autosend.py, pill |
 | `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock) | external tools | autosend.py |
 | `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
 | `~/.vibevoice/locked` | presence = pill stays visible (no auto-hide) | pill | pill |
+| `~/.vibevoice/robot_pos` | text: `x,y` — saved position of the floating robot widget (drag) | pill | pill |
+| `~/.vibevoice/tts` | presence = TTS-reactivity hook enabled (optional) | external TTS | pill |
+| `~/.vibevoice/tts.txt` | line 1 `<start_epoch> <duration_s>`, line 2+ spoken text — the pill types it out in sync, tinted red (optional) | external TTS | pill |
+| `~/.vibevoice/tts_levels.bin` | **exactly 60 × float32 little-endian** RMS of the TTS audio (optional) | external TTS | pill |
 
-The last two are **control files**, not engine-owned state: the pill writes them and
-the engine (or the pill itself) honors them — the same external-control pattern as the
-autosend pause flag. They do not violate invariant #1 (which governs `state` /
-`levels.bin` / `raw.txt`).
+The control files (`muted`, `locked`, `robot_pos`) are **not** engine-owned state: the
+pill writes them and the engine (or the pill itself) honors them — the same
+external-control pattern as the autosend pause flag. The `autosend` flag is co-owned —
+`autosend.py` owns its semantics, and the pill's **🔁 Auto-send loop** toggle writes
+`on`/`off` and spawns the daemon when it isn't already running. The `tts*` files are an
+**optional self-contained reactivity hook**: any external text-to-speech may write them,
+the pill only reads them (when `tts` is present, the pill turns red and mirrors the
+spoken sentence). None of these violate invariant #1, which governs only `state` /
+`levels.bin` / `raw.txt`. The `60` in `tts_levels.bin` mirrors `levels.bin` — both are
+read with the pill's `struct.unpack("<60f", ...)`.
 
 If you change this contract, you must change **both** the writer and every reader in
 the same commit. The `60` in `levels.bin` is duplicated as `LEVELS_LEN` (engine) and a

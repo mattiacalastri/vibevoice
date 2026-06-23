@@ -81,12 +81,23 @@ device for vibe coding: **think out loud, ship.**
   for you after dictation settles. Armed with `Cmd+Shift+Space`, fires once, then
   disarms itself — with window-level locking so it never fires into the wrong window.
 - **Inline copy (⧉)** — one tap copies the last transcription to the clipboard.
-- **Menu bar toggle** — a 🎙 menu bar item flips dictation on/off at any time.
-- **🔇 Mute (pause, not kill)** — tap the mute icon (or the menu bar) to pause the
+- **Robot command center** — a custom-drawn robot icon in the menu bar *and* a small
+  floating robot widget you can drag anywhere (position is saved). Click either for the
+  full menu; the eyes light green when listening, amber when the auto-send loop is armed.
+  The floating widget exists because recent macOS can park a freshly-created status item
+  off-screen behind the notch — the pill detects that and self-heals, but the widget
+  guarantees an always-visible control.
+- **🔇 Mute (pause, not kill)** — tap the mute icon (or the menu) to pause the
   mic without tearing down the engine, so resuming never re-prompts for the
   microphone permission.
 - **🔒 Lock (pin visible)** — keep the pill on screen instead of auto-hiding on
   silence — handy while positioning it or watching levels.
+- **🔁 Auto-send loop** — a one-tap toggle (pill icon or menu) that arms `autosend.py`
+  for continuous mode and spawns it if it isn't already running: every dictation gets an
+  automatic Return.
+- **TTS-reactivity (optional)** — a self-contained hook: any external text-to-speech can
+  write `~/.vibevoice/tts*` and the pill turns red, typing out the spoken sentence in
+  sync with the audio — a mirror of the green dictation waveform. Off unless enabled.
 - **Hides on silence** — the island stays out of your way until you speak again.
 
 ## Requirements
@@ -149,8 +160,8 @@ python3 vibevoice.py &
 3. **Autosend** — when you stop, the text is pasted into the frontmost app
    (optionally followed by Return — see [Configuration](#configuration)).
 4. **⧉ Copy** — tap the inline copy glyph to put the last transcription on the clipboard.
-5. **✕ / menu bar** — dismiss the pill with ✕, or use the **🎙** menu bar item to
-   toggle dictation on/off.
+5. **✕ / robot** — dismiss the pill with ✕, or click the **robot** (menu bar or the
+   floating widget) to toggle dictation on/off and reach Mute / Lock / Auto-send.
 
 ### Preview the design (no mic, no engine)
 
