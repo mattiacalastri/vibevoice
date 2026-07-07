@@ -90,6 +90,7 @@ import sys
 import time
 from pathlib import Path
 
+import config
 import objc
 
 from AppKit import (
@@ -101,7 +102,7 @@ from AppKit import (
     NSTrackingActiveAlways, NSTrackingCursorUpdate,
     NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
     NSBackingStoreBuffered, NSStatusWindowLevel,
-    NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
     NSString, NSPasteboard, NSPasteboardTypeString,
@@ -606,9 +607,14 @@ def _engine_running():
 
 def _start_engine():
     try:
+        cfg = config.load()
+        env = dict(os.environ)
+        env.setdefault("VIBEVOICE_LANG", cfg["lang"])
+        env.setdefault("VIBEVOICE_AUTOSEND", "1" if cfg["autosend"] else "0")
+        env.setdefault("VIBEVOICE_AUTOSEND_RETURN", "1" if cfg["autosend_return"] else "0")
         subprocess.Popen([sys.executable or "python3", str(ENGINE_PATH)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True, env=env)
     except Exception:
         pass
 
@@ -1190,7 +1196,10 @@ def main():
 
     global _CTRL, _TIMER
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    cfg = config.load()
+    app.setActivationPolicy_(
+        NSApplicationActivationPolicyRegular if cfg.get("dock", True)
+        else NSApplicationActivationPolicyAccessory)
     _CTRL = Controller.alloc().initWithDemo_place_(args.demo, args.place)
     _TIMER = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         TICK, _CTRL, "tick:", None, True)
