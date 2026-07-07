@@ -38,6 +38,7 @@
 #   ~/.vibevoice/levels.bin  60 float32 little-endian RMS values (0..1),
 #                            written atomically (tmp + os.replace)
 #   ~/.vibevoice/raw.txt     last transcription, plain text (sentence only)
+#   ~/.vibevoice/history.jsonl  last 20 transcriptions, JSONL {"ts","text"}, newest last
 #
 # CONTROL FILES (written by the pill / external tools, read by the engine — the
 # same external-control pattern as autosend's pause flag, NOT engine-owned state):
@@ -82,6 +83,7 @@ STATE_FILE = STATE_DIR / "state"        # idle | recording | transcribing
 LEVELS_FILE = STATE_DIR / "levels.bin"  # 60 float32 LE, RMS 0..1
 LEVELS_TMP = STATE_DIR / "levels.tmp"   # staging for atomic replace
 RAW_FILE = STATE_DIR / "raw.txt"        # last transcription, plain text
+HISTORY_FILE = STATE_DIR / "history.jsonl"  # last 20 transcriptions, JSONL {"ts","text"}
 MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
 
 
@@ -97,6 +99,8 @@ BLOCKSIZE = 1600        # ~100 ms per audio block at 16 kHz
 
 LEVELS_LEN = 60         # number of float32 RMS samples in levels.bin
 LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
+
+HISTORY_MAX = 20        # max lines in history.jsonl
 
 VAD_THRESHOLD = 0.015   # RMS above this starts/sustains "recording"
 SILENCE_SEC = 1.5       # trailing silence that ends an utterance
@@ -139,6 +143,22 @@ def write_raw(text: str) -> None:
     """Write the last transcription as plain text (sentence only, no metadata)."""
     try:
         RAW_FILE.write_text(text)
+    except Exception:
+        pass
+
+
+def _append_history(text: str) -> None:
+    """Append to history.jsonl, newest last, capped. Never raises (transcription path)."""
+    try:
+        import json
+        import time
+        lines = []
+        try:
+            lines = HISTORY_FILE.read_text().splitlines()
+        except OSError:
+            pass
+        lines.append(json.dumps({"ts": time.time(), "text": text}))
+        HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
     except Exception:
         pass
 
@@ -461,6 +481,7 @@ class Engine:
             text = transcribe(audio)
             if text:
                 write_raw(text)
+                _append_history(text)
                 if AUTOSEND:
                     # Paste off the worker thread so we return to idle promptly.
                     threading.Thread(

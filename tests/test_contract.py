@@ -209,3 +209,26 @@ def test_pause_flag_expired_self_clears(autosend_mod):
 
 def test_pause_flag_absent_is_not_paused(autosend_mod):
     assert autosend_mod.is_paused_by_flag() is False
+
+
+# ── history.jsonl: last transcriptions (settings window reads this) ───────────
+
+@pytest.fixture
+def history_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "HISTORY_FILE", tmp_path / "history.jsonl")
+    return tmp_path
+
+
+def test_history_appends_and_caps(history_state):
+    import json
+    for i in range(25):
+        engine._append_history(f"frase {i}")
+    lines = (history_state / "history.jsonl").read_text().splitlines()
+    assert len(lines) == engine.HISTORY_MAX == 20
+    assert json.loads(lines[-1])["text"] == "frase 24"   # newest last
+    assert set(json.loads(lines[0])) == {"ts", "text"}
+
+
+def test_history_write_failure_never_raises(history_state, monkeypatch):
+    monkeypatch.setattr(engine, "HISTORY_FILE", history_state / "no" / "dir.jsonl")
+    engine._append_history("must not raise")  # transcription path must survive

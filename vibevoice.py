@@ -45,6 +45,7 @@ STATE-FILE CONTRACT (shared pill <-> engine, under ~/.vibevoice/):
   ~/.vibevoice/state       text file, one of: idle | recording | transcribing
   ~/.vibevoice/levels.bin  60 float32 little-endian (RMS 0..1), atomic write
   ~/.vibevoice/raw.txt     last transcription, plain text (just the sentence)
+  ~/.vibevoice/history.jsonl  last 20 transcriptions, JSONL {"ts","text"}, newest last
 
 The engine WRITES these files; the pill READS them.
 
