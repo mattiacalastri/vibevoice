@@ -50,3 +50,11 @@ A macOS speech-to-text utility: three decoupled processes (`engine.py`,
 `AGENTS.md` §7 has the full "where to look for what" map. Quick version:
 `engine.py` = capture/VAD/transcribe/paste · `vibevoice.py` = pill UI + menu-bar
 master switch · `autosend.py` = standalone auto-Return daemon.
+
+## Trap: the namesake on Mattia's Mac
+
+`/Applications/VibeVoice.app` is NOT built from this repo: it is the legacy
+daily-driver (`~/scripts/stt_bar.py`, Apple SR it-IT, state in
+`~/.local/run/jarvis/`, LaunchAgent `com.vibevoice.dictation`). This repo =
+whisper-turbo, `~/.vibevoice/`, bundle id `com.vibevoice.app`. Never run both
+at once (they fight over the mic and autosend).
