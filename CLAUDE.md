@@ -36,6 +36,13 @@ A macOS speech-to-text utility: three decoupled processes (`engine.py`,
 7. **macOS-only.** AppKit, CoreAudio, and `mlx_whisper` (Apple Silicon). Don't
    add cross-platform shims; gate optional deps with lazy imports as the code
    already does.
+8. **Release packaging only via `bash packaging/build_release.sh`** — never
+   `setup_py2app.py py2app` directly: raw py2app output passes `plutil` and
+   exits 0 but is **import-dead** (mlx/tiktoken/tqdm are invisible to
+   modulegraph; the post-build graft + origin-asserted smoke in the script are
+   what make the bundle real). Green build ≠ working bundle. And in the bundle
+   `sys.executable` is the app launcher, not python — spawn children through
+   `_child_python()` only.
 
 ## Before you commit — definition of done
 
