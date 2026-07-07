@@ -102,12 +102,14 @@ from AppKit import (
     NSTrackingMouseEnteredAndExited, NSTrackingMouseMoved,
     NSTrackingActiveAlways, NSTrackingCursorUpdate,
     NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
+    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
     NSBackingStoreBuffered, NSStatusWindowLevel,
     NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
     NSString, NSPasteboard, NSPasteboardTypeString,
     NSStatusBar, NSMenuItem, NSVariableStatusItemLength,
+    NSWindow, NSTextField, NSButton, NSPopUpButton, NSTextView, NSScrollView,
 )
 from Foundation import NSObject, NSMakeSize
 
@@ -880,6 +882,9 @@ class Controller(NSObject):
         self.mb_loop = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("🔁 Auto-send loop", "toggleLoop:", "")
         self.mb_loop.setTarget_(self)
         menu.addItem_(self.mb_loop)
+        st = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("⚙️ Settings…", "openSettings:", ",")
+        st.setTarget_(self)
+        menu.addItem_(st)
         menu.addItem_(NSMenuItem.separatorItem())
         ri = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("↻ Restart pill", "restartPill:", "")
         ri.setTarget_(self)
@@ -927,6 +932,107 @@ class Controller(NSObject):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    def restartEngine_(self, _sender=None):
+        # Kill + respawn engine.py so it picks up the new env (lang/autosend/
+        # autosend_return from config.json). No-op if the engine isn't running
+        # right now — Settings shouldn't autostart the mic.
+        if not _engine_running():
+            return
+        _stop_engine()
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.5, self, "_delayedStartEngine:", None, False)
+
+    def _delayedStartEngine_(self, _timer):
+        if not _engine_running():
+            _start_engine()
+
+    def openSettings_(self, _sender):
+        cfg = config.load()
+        if getattr(self, "_settings_win", None):
+            self._settings_win.makeKeyAndOrderFront_(None)
+            NSApp.activateIgnoringOtherApps_(True)
+            return
+        W, H = 420, 380
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSBackingStoreBuffered, False)
+        win.setTitle_("VibeVoice — Settings")
+        win.center()
+        win.setReleasedWhenClosed_(False)
+        v = win.contentView()
+
+        def _label(text, y):
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFrame_(NSMakeRect(20, y, 180, 22))
+            v.addSubview_(lbl)
+            return lbl
+
+        def _check(title, y, on, action):
+            b = NSButton.buttonWithTitle_target_action_(title, self, action)
+            b.setButtonType_(3)  # NSButtonTypeSwitch (checkbox)
+            b.setFrame_(NSMakeRect(200, y, 200, 22))
+            b.setState_(1 if on else 0)
+            v.addSubview_(b)
+            return b
+
+        _label("Language", H - 50)
+        self._set_lang = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(200, H - 54, 120, 26), False)
+        self._set_lang.addItemsWithTitles_(["it", "en"])
+        self._set_lang.selectItemWithTitle_(cfg["lang"])
+        self._set_lang.setTarget_(self)
+        self._set_lang.setAction_("settingsChanged:")
+        v.addSubview_(self._set_lang)
+
+        _label("Autosend (paste)", H - 85)
+        self._set_as = _check("enabled", H - 85, cfg["autosend"], "settingsChanged:")
+        _label("Auto-Return", H - 115)
+        self._set_ar = _check("press Return", H - 115, cfg["autosend_return"], "settingsChanged:")
+        _label("Dock icon", H - 145)
+        self._set_dk = _check("show in Dock", H - 145, cfg["dock"], "settingsChanged:")
+
+        _label("History", H - 180)
+        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, 150))
+        tv.setEditable_(False)
+        sc = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 20, W - 40, 150))
+        sc.setDocumentView_(tv)
+        sc.setHasVerticalScroller_(True)
+        v.addSubview_(sc)
+        self._set_hist = tv
+        self._reload_history()
+        self._settings_win = win
+        win.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def _reload_history(self):
+        import json
+        rows = []
+        try:
+            lines = (STATE_DIR / "history.jsonl").read_text().splitlines()
+            for ln in reversed(lines):
+                if not ln.strip():
+                    continue
+                d = json.loads(ln)
+                rows.append("• %s" % d.get("text", ""))
+        except (OSError, ValueError):
+            rows = []
+        self._set_hist.setString_("\n".join(rows) if rows else "(no transcriptions yet)")
+
+    def settingsChanged_(self, _sender):
+        cfg = {
+            "lang": str(self._set_lang.titleOfSelectedItem()),
+            "autosend": bool(self._set_as.state()),
+            "autosend_return": bool(self._set_ar.state()),
+            "dock": bool(self._set_dk.state()),
+        }
+        config.save(cfg)
+        NSApp.setActivationPolicy_(
+            NSApplicationActivationPolicyRegular if cfg["dock"]
+            else NSApplicationActivationPolicyAccessory)
+        # engine picks lang/autosend/autosend_return up on next spawn:
+        self.restartEngine_(None)
 
     def quitAll_(self, sender):
         _stop_engine()
