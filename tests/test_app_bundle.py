@@ -93,3 +93,21 @@ def test_launcher_runs_the_pill_all_in_one(app):
     body = (app / "Contents" / "MacOS" / "VibeVoice").read_text()
     assert 'exec "$PY" "$RES/vibevoice.py"' in body
     assert "VIBEVOICE_ENGINE_AUTOSTART" in body
+
+
+# ── icon ──────────────────────────────────────────────────────────────────────
+
+def test_bundle_has_icon(app):
+    assert (app / "Contents/Resources/VibeVoice.icns").stat().st_size > 10_000
+    with (app / "Contents/Info.plist").open("rb") as f:
+        assert plistlib.load(f)["CFBundleIconFile"] == "VibeVoice"
+
+
+def test_icon_respects_transparent_margin():
+    """Scar sess.9161: corners must be transparent (squircle inside the canvas)."""
+    PIL = pytest.importorskip("PIL.Image")
+    img = PIL.open(REPO / "assets/icon/VibeVoice.icns")
+    img = img.convert("RGBA")
+    w, h = img.size
+    for xy in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]:
+        assert img.getpixel(xy)[3] == 0, f"corner {xy} not transparent"

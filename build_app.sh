@@ -31,6 +31,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # ── source the launcher runs (self-contained under Resources/) ────────────────
 cp "$SRC/vibevoice.py" "$SRC/engine.py" "$SRC/autosend.py" \
    "$SRC/requirements.txt" "$APP/Contents/Resources/"
+cp "$SRC/assets/icon/VibeVoice.icns" "$APP/Contents/Resources/"
 
 # ── Info.plist — the bundle's identity + usage strings ────────────────────────
 # LSUIElement matches the app's NSApplicationActivationPolicyAccessory (notch
@@ -67,6 +68,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>VibeVoice transcribes your voice into text, locally on your Mac.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>VibeVoice uses AppleScript to detect the frontmost app and press Return after dictation.</string>
+    <key>CFBundleIconFile</key>
+    <string>VibeVoice</string>
 </dict>
 </plist>
 PLIST
