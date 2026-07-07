@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 docs/*.mp4
 dist/
+packaging/build/
+packaging/dist/
