@@ -680,6 +680,8 @@ class Controller(NSObject):
         self.demo_full = "open the dashboard and show me the real margin"
         self.demo_i = 0
         self.t0 = time.time()
+        self._restart_timer = None
+        self._restart_ticks = 0
         self._build_window()
         self._build_menubar()
         self._build_robot()
@@ -933,19 +935,46 @@ class Controller(NSObject):
         except Exception:
             pass
 
+    # Poll cadence/timeout for the post-kill respawn below: _stop_engine() fires
+    # `pkill -f engine.py` async (no wait), so we can't just fire-once after a
+    # fixed delay — if the old process is still exiting when the timer fires,
+    # skipping the start would leave the engine down for good (no lang/env
+    # update, silently). Instead poll until it's actually dead, bounded so a
+    # wedged old process can't spawn a second engine on top of it.
+    _RESTART_POLL_INTERVAL = 0.25
+    _RESTART_MAX_TICKS = 20  # ~5s
+
     def restartEngine_(self, _sender=None):
         # Kill + respawn engine.py so it picks up the new env (lang/autosend/
         # autosend_return from config.json). No-op if the engine isn't running
         # right now — Settings shouldn't autostart the mic.
         if not _engine_running():
             return
+        # Rapid successive settings changes must not stack timers.
+        if getattr(self, "_restart_timer", None) is not None:
+            self._restart_timer.invalidate()
+            self._restart_timer = None
         _stop_engine()
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.5, self, "_delayedStartEngine:", None, False)
+        self._restart_ticks = 0
+        self._restart_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            self._RESTART_POLL_INTERVAL, self, "_pollRestartEngine:", None, True)
 
-    def _delayedStartEngine_(self, _timer):
+    def _pollRestartEngine_(self, timer):
         if not _engine_running():
+            timer.invalidate()
+            self._restart_timer = None
             _start_engine()
+            return
+        self._restart_ticks += 1
+        if self._restart_ticks >= self._RESTART_MAX_TICKS:
+            timer.invalidate()
+            self._restart_timer = None
+            print(
+                "[vibevoice] restartEngine_: old engine.py still exiting after "
+                "%.1fs, giving up (not starting a second engine)"
+                % (self._RESTART_MAX_TICKS * self._RESTART_POLL_INTERVAL),
+                file=sys.stderr,
+            )
 
     def openSettings_(self, _sender):
         cfg = config.load()
