@@ -111,3 +111,18 @@ def test_icon_respects_transparent_margin():
     w, h = img.size
     for xy in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]:
         assert img.getpixel(xy)[3] == 0, f"corner {xy} not transparent"
+
+
+# ── child process spawning (py2app trap) ─────────────────────────────────────
+
+def test_child_spawns_never_use_raw_sys_executable():
+    """Scar sess.9191: in the py2app bundle sys.executable is the app LAUNCHER —
+    it ignores argv and boots the pill main again, so Popen([sys.executable,
+    engine.py]) forks a second pill instead of the engine. Every child spawn
+    must go through _child_python(), which picks the embedded
+    Contents/MacOS/python when frozen (and keeps the script path in argv so
+    invariant #8's pgrep/pkill -f engine.py still matches)."""
+    src = (REPO / "vibevoice.py").read_text()
+    assert "Popen([sys.executable" not in src
+    assert "Popen([_child_python(), str(ENGINE_PATH)]" in src
+    assert "Popen([_child_python(), str(AUTOSEND_PATH)]" in src

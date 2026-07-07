@@ -599,6 +599,21 @@ class RobotView(NSView):
         self._drag0 = None
 
 
+def _child_python():
+    """Interpreter for spawning the engine.py/autosend.py siblings.
+
+    Inside the py2app bundle sys.executable is the app LAUNCHER: it ignores
+    argv and always boots the pill main again, so spawning children through it
+    forks a second pill instead of the engine. py2app ships a real embedded
+    interpreter at Contents/MacOS/python — use that when frozen. Keeping the
+    script path in argv preserves invariant #8 (pgrep/pkill -f engine.py)."""
+    if getattr(sys, "frozen", None) == "macosx_app":
+        cand = Path(sys.executable).parent / "python"
+        if cand.exists():
+            return str(cand)
+    return sys.executable or "python3"
+
+
 def _engine_running():
     try:
         r = subprocess.run(["pgrep", "-f", "engine.py"],
@@ -615,7 +630,7 @@ def _start_engine():
         env.setdefault("VIBEVOICE_LANG", cfg["lang"])
         env.setdefault("VIBEVOICE_AUTOSEND", "1" if cfg["autosend"] else "0")
         env.setdefault("VIBEVOICE_AUTOSEND_RETURN", "1" if cfg["autosend_return"] else "0")
-        subprocess.Popen([sys.executable or "python3", str(ENGINE_PATH)],
+        subprocess.Popen([_child_python(), str(ENGINE_PATH)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=env)
     except Exception:
@@ -660,7 +675,7 @@ def _toggle_autosend():
             subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not _autosend_running():
-                subprocess.Popen([sys.executable or "python3", str(AUTOSEND_PATH)],
+                subprocess.Popen([_child_python(), str(AUTOSEND_PATH)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
     except Exception:
