@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: MIT
 """Generate VibeVoice icon candidates: teal squircle + waveform.
 
-Scar sess.9161: the squircle must live INSIDE the canvas with a transparent
-margin (~10%), never edge-to-edge, or macOS wraps it in a grey rounded rect.
+Scar sess.9161: the icon must be a squircle with TRANSPARENT corners, never an
+opaque full square, or macOS wraps it in a grey rounded rect. A transparent
+margin (~10%) is the safe default. But the margin itself reads as grey "padding"
+in the dock next to full-bleed neighbours — sess.9203 Mattia asked for it gone,
+so `--margin 0` renders a full-bleed squircle (edges touch the canvas, corners
+still transparent → no grey-wrap). Keep corners transparent at any margin.
 
-Usage: python3 make_icon.py --variant 1 --out candidate1.png
+Usage: python3 make_icon.py --variant 1 --margin 0 --out candidate1.png
 """
 from __future__ import annotations
 
@@ -14,8 +18,7 @@ import argparse
 from PIL import Image, ImageDraw
 
 S = 1024
-M = int(S * 0.10)                    # transparent margin (the scar)
-R = int((S - 2 * M) * 0.225)         # macOS squircle-ish corner radius
+CORNER_RATIO = 0.2237                # Apple macOS squircle corner radius ratio
 
 PALETTES = {1: ((13, 148, 136), (4, 47, 46)),    # teal → deep teal (AI Accelerator family)
             2: ((45, 212, 191), (15, 118, 110)), # bright aqua → teal
@@ -26,7 +29,9 @@ BARS = {1: [.30, .55, .90, .65, 1.0, .70, .45, .25],
         3: [.35, .70, 1.0, .55, .85, .40]}
 
 
-def build(variant: int) -> Image.Image:
+def build(variant: int, margin: float = 0.0) -> Image.Image:
+    M = int(S * margin)                       # transparent margin (0 = full-bleed)
+    R = int((S - 2 * M) * CORNER_RATIO)       # macOS squircle corner radius
     top, bot = PALETTES[variant]
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     grad = Image.new("RGBA", (S, S))
@@ -53,7 +58,9 @@ def build(variant: int) -> Image.Image:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", type=int, default=1, choices=sorted(PALETTES))
+    ap.add_argument("--margin", type=float, default=0.0,
+                    help="transparent margin fraction (0 = full-bleed, 0.10 = legacy safe)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    build(a.variant).save(a.out)
-    print(f"wrote {a.out}")
+    build(a.variant, a.margin).save(a.out)
+    print(f"wrote {a.out} (variant {a.variant}, margin {a.margin})")

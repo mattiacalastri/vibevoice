@@ -5,3 +5,5 @@ docs/*.mp4
 dist/
 packaging/build/
 packaging/dist/
+
+assets/icon/*.iconset/
