@@ -132,6 +132,12 @@ ROBOT_POS  = STATE_DIR / "robot_pos"      # "x,y" saved position of the floating
 ENGINE_PATH   = Path(os.path.abspath(__file__)).parent / "engine.py"
 AUTOSEND_PATH = Path(os.path.abspath(__file__)).parent / "autosend.py"
 
+# Menu-bar-only mode (sess.9203): the floating pill + robot widget are the live
+# waveform/TTS visualiser, but Mattia wants a single surface — the menu-bar item.
+# False → the pill panel is never shown and the robot widget is never built; the
+# NSStatusBar item stays the sole UI. Flip to True to bring the floating pill back.
+SHOW_PILL = False
+
 
 def _flag_on(path) -> bool:
     """True if a control flag file exists (defensive: never raises)."""
@@ -623,10 +629,28 @@ def _engine_running():
         return False
 
 
+def _clean_child_env(base=None):
+    """Environment for spawning the embedded interpreter (engine/autosend).
+
+    Inside the py2app bundle os.environ carries PYTHONHOME / PYTHONPATH /
+    PYTHONEXECUTABLE / RESOURCEPATH pointing INTO the app. Passing them to
+    Contents/MacOS/python makes it miss its own stdlib and die on the first
+    import (`ModuleNotFoundError: wave`, engine.py) within ~1s — so the menu-bar
+    toggle looked dead. Strip them so the child interpreter resolves its own
+    home. (Scar sess.9203: standalone spawn works, app-spawn crashed — the diff
+    was the inherited env, not the signature.)"""
+    env = dict(os.environ if base is None else base)
+    for k in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "RESOURCEPATH",
+              "PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE",
+              "PYVENV_LAUNCHER", "__PYVENV_LAUNCHER__"):
+        env.pop(k, None)
+    return env
+
+
 def _start_engine():
     try:
         cfg = config.load()
-        env = dict(os.environ)
+        env = _clean_child_env()
         env.setdefault("VIBEVOICE_LANG", cfg["lang"])
         env.setdefault("VIBEVOICE_AUTOSEND", "1" if cfg["autosend"] else "0")
         env.setdefault("VIBEVOICE_AUTOSEND_RETURN", "1" if cfg["autosend_return"] else "0")
@@ -677,7 +701,7 @@ def _toggle_autosend():
             if not _autosend_running():
                 subprocess.Popen([_child_python(), str(AUTOSEND_PATH)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+                                 start_new_session=True, env=_clean_child_env())
     except Exception:
         pass
 
@@ -699,7 +723,8 @@ class Controller(NSObject):
         self._restart_ticks = 0
         self._build_window()
         self._build_menubar()
-        self._build_robot()
+        if SHOW_PILL:
+            self._build_robot()
         # Optional: come up already dictating when launchd-managed. Gated by env so
         # the default (manual toggle) is unchanged. The engine is spawned here in
         # the pill's GUI/TCC context, where the mic permission resolves correctly.
@@ -807,7 +832,10 @@ class Controller(NSObject):
         view = PillView.alloc().initWithFrame_(NSMakeRect(0, 0, PILL_W, PILL_H))
         view.setAutoresizingMask_(18)   # NSViewWidthSizable|HeightSizable — grows with the panel
         panel.setContentView_(view)
-        panel.orderFrontRegardless()
+        if SHOW_PILL:
+            panel.orderFrontRegardless()
+        else:
+            panel.orderOut_(None)    # menu-bar-only: keep the pill panel off-screen
         view.updateTrackingAreas()   # install the tracking area now (AppKit won't on a hand-built panel)
         self.panel = panel
         self.view = view
@@ -1171,6 +1199,8 @@ class Controller(NSObject):
     def _animate_(self, show):
         # Dynamic Island: EXPANDS from the notch / RE-COLLAPSES into it.
         # the collapsed snap stays OUTSIDE the grouping, otherwise it jumps a frame.
+        if not SHOW_PILL:
+            return                    # menu-bar-only: the pill panel never surfaces
         if show:
             self.panel.setFrame_display_(NSMakeRect(*self.col), True)
         NSAnimationContext.beginGrouping()
