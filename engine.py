@@ -314,6 +314,50 @@ def autosend(text: str) -> None:
                 pass
 
 
+# ── Capture backends ──────────────────────────────────────────────────────────
+
+class _SounddeviceCapture:
+    """Microphone capture via sounddevice (PortAudio). Context manager.
+
+    Feeds float32 mono blocks to `callback` with the sounddevice signature
+    (indata, frames, time_info, status). This is the seam behind which the
+    voice-processing (AVAudioEngine) backend will slot in; the callback
+    contract stays identical across backends.
+    """
+
+    name = "sounddevice"
+
+    def __init__(self, callback) -> None:
+        self._callback = callback
+        self._stream = None
+
+    def __enter__(self) -> "_SounddeviceCapture":
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            blocksize=BLOCKSIZE,
+            dtype="float32",
+            callback=self._callback,
+        )
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return False
+        return stream.__exit__(exc_type, exc, tb)
+
+
+def _select_capture_backend() -> type:
+    """Pick the capture backend class.
+
+    Today: sounddevice only. F1 will try the macOS voice-processing backend
+    first (AEC/NS/AGC via AVAudioEngine) and fall back here.
+    """
+    return _SounddeviceCapture
+
+
 # ── Audio engine ─────────────────────────────────────────────────────────────
 
 class Engine:
@@ -353,14 +397,10 @@ class Engine:
         """Open the microphone and run the capture loop until stopped."""
         write_state("idle")
         write_levels(self._rms_history)
+        backend_cls = _select_capture_backend()
+        sys.stderr.write(f"VibeVoice: capture: {backend_cls.name}\n")
         try:
-            with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                blocksize=BLOCKSIZE,
-                dtype="float32",
-                callback=self._audio_callback,
-            ):
+            with backend_cls(self._audio_callback):
                 # Block here; the callback drives all the work.
                 while not self._stop.is_set():
                     self._stop.wait(0.25)

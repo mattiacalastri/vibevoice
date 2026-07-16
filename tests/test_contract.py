@@ -132,6 +132,43 @@ def test_unmuted_engine_starts_recording_on_speech(engine_state):
     assert engine.STATE_FILE.read_text() == "recording"
 
 
+# ── Capture backend seam (F1: selection point for voice-processing capture) ───
+
+def test_default_capture_backend_is_sounddevice():
+    """The seam must select sounddevice until the voice-processing backend lands."""
+    backend = engine._select_capture_backend()
+    assert backend is engine._SounddeviceCapture
+    assert backend.name == "sounddevice"
+
+
+def test_run_opens_capture_via_seam_and_logs_backend(engine_state, monkeypatch, capsys):
+    """Engine.run() must open the mic through the selected backend and announce
+    it on stderr ('capture: <name>') — headless-safe via a fake backend."""
+    opened = {}
+
+    class _FakeCapture:
+        name = "fake"
+
+        def __init__(self, callback):
+            opened["callback"] = callback
+
+        def __enter__(self):
+            opened["entered"] = True
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(engine, "_select_capture_backend", lambda: _FakeCapture)
+    eng = engine.Engine()
+    eng.stop()  # loop exits right after the stream opens — no blocking in CI
+    eng.run()
+
+    assert opened["entered"] is True
+    assert opened["callback"] == eng._audio_callback  # same signature/target as before
+    assert "capture: fake" in capsys.readouterr().err
+
+
 # ── WAV encoding for Whisper (16 kHz / 16-bit / mono) ─────────────────────────
 
 def test_save_wav_format_and_length(tmp_path, monkeypatch):
