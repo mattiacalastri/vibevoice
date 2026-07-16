@@ -46,8 +46,11 @@ runnable and testable, and lets `autosend.py` work with *any* STT, not just this
 
 | Thread | Created by | Job |
 |--------|-----------|-----|
-| main | process start | opens `sd.InputStream`, then blocks on `self._stop.wait(0.25)` |
-| audio callback | `sounddevice` | one call per ~100 ms block; runs the VAD; **must never raise** |
+| main | process start | opens the capture backend (voice-processing or sounddevice), then blocks on `self._stop.wait(0.25)` |
+| audio callback | capture backend | one call per ~100 ms block; feeds the decider + drives the state machine; **must never raise or block** |
+| VP tap (CoreAudio) | `_VoiceProcessingCapture` | copy + enqueue **only** (holding the GIL longer would starve the audio HAL) |
+| VP worker | `_VoiceProcessingCapture` | drains the tap queue, resamples native rate → 16 kHz mono (`AVAudioConverter`), invokes the audio callback |
+| `silero-vad` worker | `SileroVad.start()` | drains `submit()`'s queue, re-chunks into 512-sample frames, runs ONNX inference, publishes the speech flag with hysteresis |
 | transcription worker(s) | `_finalize` | up to **2** at once (`Semaphore(2)`); runs Whisper, writes `raw.txt`, spawns paste |
 | paste | `_transcribe_worker` | `autosend()` off-thread so state returns to `idle` promptly |
 
@@ -55,15 +58,55 @@ Locking: a single `threading.Lock` guards the VAD/capture state (`_speaking`, `_
 `_pre`, timers, `_rms_history`). The rule the code follows religiously: **decide inside
 the lock, do I/O and spawn threads outside it.** The callback computes a `do_finalize`
 flag under the lock, releases, then performs `write_state` / `_finalize` outside. Keep
-this discipline — file writes inside the audio lock would risk realtime glitches.
+this discipline — file writes inside the audio lock would risk realtime glitches. The
+decider calls (`submit` / `is_speech`) stay *outside* the lock too: both are
+non-blocking and never raise.
 
-### 2.2 VAD state machine
+### 2.2 Capture backends (F1)
 
-Energy-based voice-activity detection on per-block RMS:
+Capture is a seam: both backends feed the same callback with float32 mono blocks of
+`BLOCKSIZE` samples at `SAMPLE_RATE`, using the sounddevice signature
+`(indata, frames, time_info, status)`, `indata` shaped `(N, 1)`.
+
+- **`_VoiceProcessingCapture`** (default, `VIBEVOICE_VP=1`): `AVAudioEngine` with
+  `setVoiceProcessingEnabled_(True)` on the input node — the AEC/NS/AGC stack FaceTime
+  uses. The Mac's own speaker output is subtracted from the mic signal *at the source*:
+  this is the full-duplex prerequisite (the pill can speak while listening without
+  transcribing itself). The tap block runs on a CoreAudio thread and only copies +
+  enqueues; a dedicated worker resamples and calls the engine callback.
+- **`_SounddeviceCapture`**: the legacy PortAudio path, kept as the universal fallback.
+
+Selection (`_select_capture_backend`) prefers voice processing unless `VIBEVOICE_VP=0`
+or `AVFoundation` is not importable (`_ensure_avfoundation`, lazy tri-state — prints an
+install hint once). Failures at *open time* (mic permission, VP API errors) degrade to
+sounddevice inside `Engine.run()` instead of killing the engine. Both degradations are
+locked by `test_full_run_without_avfoundation_captures_via_sounddevice`.
+
+### 2.3 Speech decision (F2) + utterance state machine
+
+The speech/non-speech **decision** comes from `SileroVad` — the Silero VAD ONNX model
+(onnxruntime, CPU, single-threaded) running on its own worker thread. The audio callback
+only calls `submit(block, rms)` (bounded `put_nowait`; drops blocks when the queue is
+full) and `is_speech()` (one attribute read). The worker re-chunks the ~100 ms capture
+blocks into 512-sample model frames (64-sample context, recurrent state threaded
+through), and publishes the flag with onset/offset hysteresis (`SILERO_ONSET` /
+`SILERO_OFFSET`; in between, the previous decision holds) so borderline frames don't
+flap.
+
+**Degradation contract**: without `onnxruntime` or a model (`_resolve_silero_model`
+cascade: `VIBEVOICE_SILERO_MODEL` env path → `silero_vad` package data → None), or after
+a mid-stream inference failure, `is_speech()` returns `rms >= VAD_THRESHOLD` —
+bit-identical to the legacy energy VAD (locked by
+`test_full_flow_without_onnxruntime_behaves_like_legacy`). The raw RMS keeps feeding
+`levels.bin` regardless of who decides — the waveform is capture-driven, not
+decision-driven.
+
+The utterance state machine on top of that decision is unchanged:
 
 ```
-            rms ≥ VAD_THRESHOLD                 rms < VAD_THRESHOLD
-                  (speech)                            (silence)
+          decider says speech                  decider says silence
+     (Silero flag; rms ≥ VAD_THRESHOLD    (Silero flag off; rms < VAD_THRESHOLD
+            on the fallback)                      on the fallback)
    ┌────────┐  onset: start utterance,   ┌───────────┐  start silence timer
    │  idle  │ ───────────────────────►   │ recording │ ─────────────────────┐
    │        │  include PRE_ROLL_BLOCKS    │           │                      │
@@ -86,7 +129,7 @@ Energy-based voice-activity detection on per-block RMS:
 - **Backpressure**: if both transcription slots are busy at finalize, that utterance is
   dropped and state returns to `idle` rather than queuing unbounded work.
 
-### 2.3 Transcription & paste
+### 2.4 Transcription & paste
 
 `transcribe()` writes the float32 buffer to a temp 16 kHz/16-bit WAV and calls
 `mlx_whisper.transcribe(path_or_hf_repo=MODEL, language=LANG)`. `mlx_whisper` is imported
@@ -164,7 +207,10 @@ A `pynput` global keyboard listener, independent of the engine. Behavior:
 |----------|------|-------|-----------|
 | `SAMPLE_RATE` | engine | 16000 | mlx_whisper expects 16 kHz mono |
 | `BLOCKSIZE` | engine | 1600 | ~100 ms/block → VAD reacts within a tenth of a second |
-| `VAD_THRESHOLD` | engine | 0.015 | RMS gate between noise floor and speech |
+| `VAD_THRESHOLD` | engine | 0.015 | RMS gate between noise floor and speech (fallback decision + levels feed) |
+| `SILERO_ONSET` / `SILERO_OFFSET` | engine | 0.5 / 0.35 | speech-probability hysteresis: ≥ onset → ON, ≤ offset → OFF, in between → hold |
+| `SILERO_FRAME` / `SILERO_CONTEXT` | engine | 512 / 64 | Silero v5 ONNX contract: samples per inference frame / context samples prepended |
+| `SILERO_QUEUE_MAX` | engine | 32 | submit()→worker backlog cap; beyond this, blocks are dropped (never block the callback) |
 | `SILENCE_SEC` | engine | 1.5 | trailing silence that ends an utterance |
 | `MIN_DUR` | engine | 0.4 | below this = noise, dropped |
 | `MAX_DUR` | engine | 15.0 | force-flush to keep blobs in the recognizer's comfort window + steady cadence on long dictation |
@@ -191,4 +237,8 @@ A `pynput` global keyboard listener, independent of the engine. Behavior:
 | Return fires twice / unexpectedly | both engine `AUTOSEND_RETURN` and `autosend.py` active | `AGENTS.md` §4 |
 | Long monologue truncated | `Semaphore` reduced to 1, or `MAX_DUR` too low | engine `_finalize`, invariant #4/#5 |
 | Mic permission error at start | Microphone privacy grant | `Engine.run` error message |
+| "voice-processing capture disabled" on stderr | `pyobjc-framework-AVFoundation` not installed (or `VIBEVOICE_VP=0`) — engine keeps running on sounddevice, just without Apple AEC | `_ensure_avfoundation` |
+| "capture 'voice-processing' failed … falling back" | VP open-time error (mic permission, VP API) — degraded to sounddevice, not fatal | `Engine.run` fallback chain |
+| "Silero VAD disabled … RMS threshold" on stderr | `onnxruntime` / model missing — decision degrades to the legacy energy VAD, flow unchanged | `_ensure_onnxruntime`, `_resolve_silero_model` |
+| Speech flag frozen mid-session | Silero inference failed mid-stream — decider flips itself to the RMS fallback and logs it | `SileroVad._run` |
 ```

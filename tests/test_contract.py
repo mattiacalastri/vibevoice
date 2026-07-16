@@ -465,6 +465,94 @@ def test_run_starts_and_stops_the_decider(engine_state, monkeypatch):
     assert calls == ["start", "stop"]
 
 
+# ── Degradation lock-down (task 5: no onnxruntime / no AVFoundation) ──────────
+
+def test_full_flow_without_onnxruntime_behaves_like_legacy(
+    engine_state, monkeypatch, capsys
+):
+    """Machine WITHOUT onnxruntime (sys.modules poisoned, REAL
+    _ensure_onnxruntime): the whole callback→finalize→transcribe flow must
+    behave exactly as today — RMS-threshold decisions, same state-file
+    transitions, transcription published to raw.txt + history."""
+    import sys as _sys
+    monkeypatch.setattr(engine, "_ORT", None)
+    monkeypatch.setattr(engine, "_ORT_AVAILABLE", None)     # reset tri-state cache
+    monkeypatch.setitem(_sys.modules, "onnxruntime", None)  # import → ImportError
+    monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
+    # Deterministic finalize in CI: no real-time waits, no clipboard, no model.
+    monkeypatch.setattr(engine, "SILENCE_SEC", 0.0)
+    monkeypatch.setattr(engine, "MIN_DUR", 0.0)
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+    monkeypatch.setattr(engine, "HISTORY_FILE", engine_state / "history.jsonl")
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "senza onnx")
+
+    eng = engine.Engine()
+    eng._vad.start()  # degrades in place: no worker thread, RMS fallback
+    assert eng._vad._worker is None
+    assert eng._vad._active is False
+    assert "onnxruntime" in capsys.readouterr().err  # the real install hint fired
+
+    loud = np.full((engine.BLOCKSIZE, 1), 0.5, dtype=np.float32)
+    quiet = np.zeros((engine.BLOCKSIZE, 1), dtype=np.float32)
+
+    eng._audio_callback(loud, engine.BLOCKSIZE, None, None)
+    assert eng._speaking is True                            # RMS onset, exactly as today
+    assert engine.STATE_FILE.read_text() == "recording"
+
+    eng._audio_callback(quiet, engine.BLOCKSIZE, None, None)  # arms the silence timer
+    eng._audio_callback(quiet, engine.BLOCKSIZE, None, None)  # SILENCE_SEC=0 → finalize
+
+    assert eng._speaking is False
+    assert _wait_until(
+        lambda: engine.RAW_FILE.exists() and engine.RAW_FILE.read_text() == "senza onnx"
+    ), "transcription never reached raw.txt on the degraded path"
+    assert _wait_until(lambda: engine.STATE_FILE.read_text() == "idle")
+    assert engine.HISTORY_FILE.exists()
+
+
+def test_full_run_without_avfoundation_captures_via_sounddevice(
+    engine_state, monkeypatch, capsys
+):
+    """Machine WITHOUT pyobjc-framework-AVFoundation (sys.modules poisoned,
+    REAL _ensure_avfoundation): Engine.run() must degrade to sounddevice and
+    the capture flow must keep working exactly as today under the fallback."""
+    import sys as _sys
+    monkeypatch.setattr(engine, "_AVF", None)
+    monkeypatch.setattr(engine, "_AVF_AVAILABLE", None)      # reset tri-state cache
+    monkeypatch.setitem(_sys.modules, "AVFoundation", None)  # import → ImportError
+    monkeypatch.setattr(engine, "VP_ENABLED", True)
+    monkeypatch.setattr(engine, "_resolve_silero_model", lambda: None)  # keep F2 out of the frame
+
+    seen = {}
+
+    class _FakeSounddevice:
+        name = "sounddevice"
+
+        def __init__(self, callback):
+            self._callback = callback
+
+        def __enter__(self):
+            # Prove the degraded backend still drives the normal capture flow.
+            loud = np.full((engine.BLOCKSIZE, 1), 0.5, dtype=np.float32)
+            self._callback(loud, engine.BLOCKSIZE, None, None)
+            seen["state_after_loud"] = engine.STATE_FILE.read_text()
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(engine, "_SounddeviceCapture", _FakeSounddevice)
+    eng = engine.Engine()
+    eng.stop()  # loop exits right after the stream opens — no blocking in CI
+    eng.run()
+
+    err = capsys.readouterr().err
+    assert "pyobjc-framework-AVFoundation" in err  # the real install hint fired
+    assert "capture: sounddevice" in err
+    assert seen["state_after_loud"] == "recording"  # callback flow intact under fallback
+    assert engine.STATE_FILE.read_text() == "idle"  # run() closed the session cleanly
+
+
 # ── WAV encoding for Whisper (16 kHz / 16-bit / mono) ─────────────────────────
 
 def test_save_wav_format_and_length(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@ file is the engineering contract underneath it.)
 
 ```
 vibevoice/
-├── engine.py                     # capture → VAD → Whisper → paste (sole writer of state files)
+├── engine.py                     # capture (voice-processing|sounddevice) → speech decider (Silero|RMS) → Whisper → paste (sole writer of state files)
 ├── vibevoice.py                  # the pill UI + menu-bar master switch (reads state files)
 ├── autosend.py                   # standalone one-shot auto-Return daemon (pynput)
 ├── build_app.sh                  # assembles a double-clickable VibeVoice.app (own TCC identity) -> dist/
@@ -98,6 +98,22 @@ If you change this contract, you must change **both** the writer and every reade
 the same commit. The `60` in `levels.bin` is duplicated as `LEVELS_LEN` (engine) and a
 hard-coded `60` in the pill's `struct.unpack("<60f", ...)` — keep them in lockstep.
 
+**The full-duplex jump (F1 capture backend + F2 Silero decider) changed NOTHING in this
+contract.** Same writers, same readers, same formats: `levels.bin` is still exactly 60
+float32 LE fed by the raw RMS (whoever makes the speech decision), and `state` still
+cycles `idle → recording → transcribing → idle`. Both new pieces are engine-internal and
+optional — without `onnxruntime` the decision degrades to the RMS threshold, without
+`AVFoundation` capture degrades to sounddevice — and the degraded flow is bit-identical
+to the legacy one (locked by the degradation tests in `tests/test_contract.py`).
+
+**`muted` stays a manual master switch.** It is written by the pill (the 🔇 toggle) and
+read by the engine — full-duplex did **not** turn it into an auto-ducking channel, and no
+component may start writing it automatically. Echo suppression while the Mac speaks is
+the job of the voice-processing capture backend (Apple AEC at the source), not of this
+flag. Verified at GATE 1 (2026-07-16): no script outside this repo writes
+`~/.vibevoice/muted` — the legacy namesake (`voice_briefing.py`) touches only
+`~/.local/run/jarvis/` — so no out-of-repo patch is needed or wanted.
+
 ---
 
 ## 3. Hard invariants — DO NOT break these
@@ -110,10 +126,15 @@ because the code keeps "working" in the happy path.
 2. **`levels.bin` is exactly 60 float32 LE, written atomically.** The pill guards
    against torn reads (`if len(data) < 60*4: skip frame`). Keep the atomic
    `tmp + os.replace` write and keep both sides agreeing on `60`.
-3. **The audio callback (`Engine._audio_callback`) must never raise.** It runs on the
-   realtime `sounddevice` thread; it swallows all exceptions on purpose. File I/O and
-   thread spawning are deferred to *outside* the lock. Do not add work that can throw
-   or block inside the lock.
+3. **The audio callback (`Engine._audio_callback`) must never raise — and never block.**
+   It runs on the realtime capture thread (sounddevice or the voice-processing worker);
+   it swallows all exceptions on purpose. File I/O and thread spawning are deferred to
+   *outside* the lock. Do not add work that can throw or block inside the lock.
+   **This extends to the speech decider (F2):** the only decider calls allowed on the
+   audio thread are `SileroVad.submit()` (bounded `put_nowait`, drops on overflow,
+   swallows everything) and `is_speech()` (a single attribute read). Silero ONNX
+   inference runs exclusively on the `silero-vad` worker thread — never move it into
+   the callback, and never make `submit()` blocking.
 4. **Keep `self._busy = threading.Semaphore(2)`.** Two transcriptions may be in flight
    so the tail of a long utterance isn't dropped while the previous blob is still being
    transcribed. Reverting to `Semaphore(1)` reintroduces the dropped-monologue bug
@@ -159,6 +180,8 @@ not just this engine.
 ```bash
 pip install -r requirements.txt        # pyobjc (+AVFoundation), mlx-whisper, sounddevice, numpy
 pip install pynput                     # only needed for autosend.py
+pip install onnxruntime silero-vad     # optional: neural speech decider (F2) — without
+                                       # them the decision degrades to the RMS threshold
 
 python3 vibevoice.py                   # live pill (reads engine state files)
 python3 vibevoice.py --demo            # animated preview, no mic — use to iterate on UI
@@ -178,6 +201,7 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_AUTOSEND` | `1` | paste transcription into frontmost app |
 | `VIBEVOICE_AUTOSEND_RETURN` | `0` | press Return after pasting |
 | `VIBEVOICE_VP` | `1` | capture via macOS voice processing (AVAudioEngine + Apple AEC/NS/AGC — the full-duplex prerequisite); `0` forces sounddevice. Auto-falls back to sounddevice when AVFoundation is missing or the VP path fails at open time |
+| `VIBEVOICE_SILERO_MODEL` | *(unset)* | explicit path to a Silero VAD ONNX model; overrides the copy shipped with the `silero_vad` package. If the path doesn't exist it warns and cascades to the package model; with neither the model nor `onnxruntime` available the speech decision falls back to the RMS threshold (`VAD_THRESHOLD`) |
 
 ### Environment variables (pill)
 | Var | Default | Meaning |
@@ -210,6 +234,12 @@ still verified behaviorally. After any change, also exercise the path you touche
   lands in both (invariant #6) and Return behaves as configured (section 4).
 - **Contract changes** → grep for every reader before editing a writer:
   `grep -rn "levels.bin\|raw.txt\|\.vibevoice/state" .`
+- **Degradation paths are contract, not best-effort** → the no-`onnxruntime` and
+  no-`AVFoundation` flows are locked headless in `tests/test_contract.py`
+  (`test_full_flow_without_onnxruntime_behaves_like_legacy`,
+  `test_full_run_without_avfoundation_captures_via_sounddevice`). If you touch the
+  decider or a capture backend, those tests must stay green unmodified — a machine
+  without the optional deps must behave exactly like the pre-full-duplex engine.
 
 Style: the repo is `ruff`-clean (a `.ruff_cache` is present). Run `ruff check .` if
 available and keep it green. Match the existing comment density — the code favors short
@@ -222,6 +252,8 @@ available and keep it green. Match the existing comment density — the code fav
 | If you're touching… | Go to |
 |---------------------|-------|
 | VAD thresholds, silence/duration tuning, transcription | `engine.py` → `Engine`, module constants |
+| Capture backend (voice processing / Apple AEC, sounddevice fallback) | `engine.py` → `_VoiceProcessingCapture`, `_SounddeviceCapture`, `_select_capture_backend`, `_ensure_avfoundation` |
+| Speech/non-speech decision (Silero VAD worker, RMS fallback, hysteresis) | `engine.py` → `SileroVad`, `_resolve_silero_model`, `_ensure_onnxruntime`, `SILERO_*` constants |
 | The paste mechanism / Electron compatibility | `engine.py` → `_press_key_cg`, `autosend` |
 | Pill geometry, notch detection, animation | `vibevoice.py` → `Controller._build_window`, `_animate_` |
 | Waveform / text rendering | `vibevoice.py` → `PillView.drawRect_` |

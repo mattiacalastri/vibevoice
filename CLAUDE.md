@@ -30,13 +30,23 @@ A macOS speech-to-text utility: three decoupled processes (`engine.py`,
 5. **Don't rename `engine.py`** without updating all three `pgrep/pkill -f
    engine.py` call sites in `vibevoice.py` and keeping it a sibling of the pill
    (invariants #8 / #10 in `AGENTS.md`).
-6. **The audio callback must never raise.** `Engine._audio_callback` runs on the
-   realtime audio thread and swallows exceptions on purpose. Do not add throwing
-   or blocking work inside its lock; defer I/O and thread spawns to outside it.
+6. **The audio callback must never raise — and never block.** `Engine._audio_callback`
+   runs on the realtime capture thread (sounddevice or the voice-processing
+   worker) and swallows exceptions on purpose. Do not add throwing or blocking
+   work inside its lock; defer I/O and thread spawns to outside it. This extends
+   to the Silero decider: on the audio thread only `SileroVad.submit()`
+   (non-blocking `put_nowait`) and `is_speech()` (attribute read) are allowed —
+   ONNX inference stays on the `silero-vad` worker thread.
 7. **macOS-only.** AppKit, CoreAudio, and `mlx_whisper` (Apple Silicon). Don't
    add cross-platform shims; gate optional deps with lazy imports as the code
-   already does.
-8. **Release packaging only via `bash packaging/build_release.sh`** — never
+   already does (`_ensure_avfoundation`, `_ensure_onnxruntime`, `_ensure_mlx_whisper`).
+8. **Degradation is contract.** Without `onnxruntime`/the Silero model the speech
+   decision falls back to the RMS threshold; without `AVFoundation` (or with
+   `VIBEVOICE_VP=0`) capture falls back to sounddevice — in both cases the engine
+   must behave exactly like the pre-full-duplex one. Locked by the degradation
+   tests in `tests/test_contract.py`; keep them green unmodified. `~/.vibevoice/muted`
+   stays a **manual** master switch (pill-written) — never auto-duck through it.
+9. **Release packaging only via `bash packaging/build_release.sh`** — never
    `setup_py2app.py py2app` directly: raw py2app output passes `plutil` and
    exits 0 but is **import-dead** (mlx/tiktoken/tqdm are invisible to
    modulegraph; the post-build graft + origin-asserted smoke in the script are
