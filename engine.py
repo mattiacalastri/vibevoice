@@ -54,6 +54,10 @@
 #                             AEC/NS/AGC — the full-duplex prerequisite);
 #                             "0" forces sounddevice (default: "1"; any
 #                             voice-processing failure falls back to sounddevice)
+#   VIBEVOICE_SILERO_MODEL    path to a Silero VAD ONNX model; overrides the
+#                             copy shipped with the `silero_vad` package. With
+#                             neither the model nor onnxruntime available the
+#                             speech decision falls back to the RMS threshold.
 # ---------------------------------------------------------------------------
 
 import os
@@ -109,6 +113,11 @@ LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
 HISTORY_MAX = 20        # max lines in history.jsonl
 
 VAD_THRESHOLD = 0.015   # RMS above this starts/sustains "recording"
+SILERO_ONSET = 0.5      # speech probability that turns the decision ON (hysteresis high)
+SILERO_OFFSET = 0.35    # probability that turns it OFF (hysteresis low; in between = hold)
+SILERO_FRAME = 512      # samples per Silero inference frame at 16 kHz (model contract)
+SILERO_CONTEXT = 64     # context samples prepended to each frame (v5 ONNX contract)
+SILERO_QUEUE_MAX = 32   # submit()→worker backlog cap; beyond this, blocks are dropped
 SILENCE_SEC = 1.5       # trailing silence that ends an utterance
 MIN_DUR = 0.4           # discard utterances shorter than this (seconds)
 MAX_DUR = 15.0          # force finalize after this many seconds (short enough to keep each blob within the recognizer's comfort window + sustain rhythm on long dictation)
@@ -566,6 +575,200 @@ def _select_capture_backend() -> type:
     if VP_ENABLED and _ensure_avfoundation():
         return _VoiceProcessingCapture
     return _SounddeviceCapture
+
+
+# ── Speech decider (F2: Silero VAD on a worker thread, RMS fallback) ─────────
+
+# onnxruntime is optional (same lazy tri-state pattern as _ensure_mlx_whisper):
+# without it the speech decision degrades to the RMS threshold, exactly as today.
+_ORT = None            # lazily imported onnxruntime module
+_ORT_AVAILABLE = None  # tri-state: None=unknown, True/False once checked
+
+
+def _ensure_onnxruntime() -> bool:
+    """Import onnxruntime lazily. Returns True if available, else prints help."""
+    global _ORT, _ORT_AVAILABLE
+    if _ORT_AVAILABLE is not None:
+        return _ORT_AVAILABLE
+    try:
+        import onnxruntime  # type: ignore
+        _ORT = onnxruntime
+        _ORT_AVAILABLE = True
+    except Exception as err:
+        _ORT_AVAILABLE = False
+        sys.stderr.write(
+            "VibeVoice: 'onnxruntime' is not available — Silero VAD disabled, "
+            "speech detection stays on the RMS threshold.\n"
+            "For neural speech/non-speech decisions install it with:\n"
+            "    pip install onnxruntime silero-vad\n"
+            f"Import error: {err}\n"
+        )
+    return _ORT_AVAILABLE
+
+
+def _resolve_silero_model() -> str | None:
+    """Locate the Silero VAD ONNX model, in cascade:
+
+    1. VIBEVOICE_SILERO_MODEL (explicit path; if it doesn't exist, warn and
+       keep cascading rather than silently running a different model),
+    2. the `silero_vad` package data — found via find_spec WITHOUT importing
+       the package (importing it would drag in torch just to read a path),
+    3. None → the decider stays on the RMS-threshold fallback.
+    """
+    env = os.environ.get("VIBEVOICE_SILERO_MODEL", "").strip()
+    if env:
+        if Path(env).exists():
+            return env
+        sys.stderr.write(
+            f"VibeVoice: VIBEVOICE_SILERO_MODEL='{env}' does not exist — "
+            "trying the silero_vad package model.\n"
+        )
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("silero_vad")
+        if spec is not None and spec.origin:
+            candidate = Path(spec.origin).parent / "data" / "silero_vad.onnx"
+            if candidate.exists():
+                return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
+def _create_silero_session(model_path: str):
+    """Build the onnxruntime session (the seam tests replace with a fake).
+
+    Single-threaded CPU on purpose: one 512-sample frame every 32 ms is tiny
+    work, and the decider already runs on its own worker thread.
+    """
+    opts = _ORT.SessionOptions()
+    opts.inter_op_num_threads = 1
+    opts.intra_op_num_threads = 1
+    opts.log_severity_level = 3  # errors only — no ORT chatter on the engine's stderr
+    return _ORT.InferenceSession(
+        model_path, sess_options=opts, providers=["CPUExecutionProvider"]
+    )
+
+
+class SileroVad:
+    """Speech/non-speech decider backed by the Silero VAD ONNX model.
+
+    The audio callback talks to it through two non-blocking calls only:
+    `submit(block, rms)` (bounded put_nowait + a synchronous RMS decision) and
+    `is_speech()` (a single attribute read — atomic under the GIL). Inference
+    never runs on the audio thread: a dedicated worker re-chunks the ~100 ms
+    capture blocks into the model's 512-sample frames (with carry across
+    blocks), threads the recurrent state through consecutive calls, and
+    publishes the decision with onset/offset hysteresis (SILERO_ONSET /
+    SILERO_OFFSET) so borderline frames don't make the flag flap.
+
+    Degradation contract: when onnxruntime or the model is unavailable — or a
+    session/inference error occurs mid-stream — is_speech() returns
+    (rms >= VAD_THRESHOLD), bit-identical to the legacy energy VAD.
+    """
+
+    def __init__(self) -> None:
+        self._session = None
+        self._active = False       # True only while the ONNX path is live
+        self._speech = False       # model decision, published by the worker
+        self._rms_speech = False   # threshold decision, updated in submit()
+        self._queue: queue.Queue = queue.Queue(maxsize=SILERO_QUEUE_MAX)
+        self._stopping = threading.Event()
+        self._worker: threading.Thread | None = None
+        # Worker-thread-only state: model recurrence + re-chunk carry.
+        self._state: np.ndarray | None = None
+        self._context: np.ndarray | None = None
+        self._carry = np.zeros(0, dtype=np.float32)
+        self._sr = np.array(SAMPLE_RATE, dtype=np.int64)
+
+    def start(self) -> "SileroVad":
+        """Resolve the model and spawn the worker. On any failure the decider
+        stays fully usable on the RMS fallback — never raises."""
+        model = _resolve_silero_model()
+        if model is None or not _ensure_onnxruntime():
+            return self
+        try:
+            self._session = _create_silero_session(model)
+        except Exception as err:
+            sys.stderr.write(
+                f"VibeVoice: Silero VAD session failed ({err}); "
+                "speech detection stays on the RMS threshold.\n"
+            )
+            return self
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(SILERO_CONTEXT, dtype=np.float32)
+        self._active = True
+        self._worker = threading.Thread(target=self._run, name="silero-vad", daemon=True)
+        self._worker.start()
+        sys.stderr.write(f"VibeVoice: VAD: silero ({model})\n")
+        return self
+
+    def stop(self) -> None:
+        """Stop the worker thread (idempotent). Fallback reads keep working."""
+        self._active = False
+        self._stopping.set()
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.join(timeout=2.0)
+
+    # -- audio-callback side (non-blocking, never raises) ----------------------
+
+    def submit(self, block: np.ndarray, rms: float) -> None:
+        """Feed one capture block. Never blocks, never raises (callback path)."""
+        try:
+            self._rms_speech = rms >= VAD_THRESHOLD
+            if not self._active:
+                return
+            # Copy: the queue must own its samples — the callback's buffer is reused.
+            self._queue.put_nowait(np.array(block, dtype=np.float32, copy=True).reshape(-1))
+        except Exception:
+            pass  # full queue (drop the block) or teardown race — never raise
+
+    def is_speech(self) -> bool:
+        """Current decision. A single attribute read — safe on the audio thread."""
+        return self._speech if self._active else self._rms_speech
+
+    # -- worker thread ----------------------------------------------------------
+
+    def _run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                block = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                self._ingest(block)
+            except Exception as err:
+                # A broken session must degrade, not freeze a stale decision:
+                # flip to the RMS fallback and stop consuming.
+                self._active = False
+                sys.stderr.write(
+                    f"VibeVoice: Silero VAD inference failed ({err}); "
+                    "falling back to the RMS threshold.\n"
+                )
+                return
+
+    def _ingest(self, block: np.ndarray) -> None:
+        """Re-chunk arbitrary block sizes into SILERO_FRAME frames, with carry."""
+        buf = np.concatenate([self._carry, block]) if self._carry.size else block
+        end = (buf.size // SILERO_FRAME) * SILERO_FRAME
+        for off in range(0, end, SILERO_FRAME):
+            self._infer(buf[off:off + SILERO_FRAME])
+        self._carry = buf[end:]
+
+    def _infer(self, frame: np.ndarray) -> None:
+        """One model step (v5 ONNX contract: 64-sample context + 512-sample
+        frame, recurrent state (2,1,128), sr int64) + hysteresis on the prob."""
+        x = np.concatenate([self._context, frame]).reshape(1, -1).astype(np.float32, copy=False)
+        outs = self._session.run(None, {"input": x, "state": self._state, "sr": self._sr})
+        self._state = np.asarray(outs[1], dtype=np.float32)
+        self._context = x[0, -SILERO_CONTEXT:]
+        prob = float(np.asarray(outs[0]).reshape(-1)[0])
+        if prob >= SILERO_ONSET:
+            self._speech = True
+        elif prob <= SILERO_OFFSET:
+            self._speech = False
+        # between OFFSET and ONSET: hold the previous decision (hysteresis)
 
 
 # ── Audio engine ─────────────────────────────────────────────────────────────

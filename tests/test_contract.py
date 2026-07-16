@@ -14,6 +14,7 @@ Run:  pytest -q
 from __future__ import annotations
 
 import struct
+import time
 import wave
 from collections import deque
 
@@ -243,6 +244,106 @@ def test_run_opens_capture_via_seam_and_logs_backend(engine_state, monkeypatch, 
     assert opened["entered"] is True
     assert opened["callback"] == eng._audio_callback  # same signature/target as before
     assert "capture: fake" in capsys.readouterr().err
+
+
+# ── Speech decider (F2: Silero VAD on a worker thread, RMS-threshold fallback) ─
+
+class _FakeSileroSession:
+    """Stand-in for onnxruntime.InferenceSession with a fixed speech
+    probability. Echoes the recurrent state back incremented by 1 so the test
+    can observe the state actually flowing through consecutive calls."""
+
+    def __init__(self, prob: float) -> None:
+        self.prob = prob
+        self.feeds: list[dict] = []
+
+    def run(self, _output_names, feeds):
+        self.feeds.append({k: np.array(v, copy=True) for k, v in feeds.items()})
+        return [
+            np.array([[self.prob]], dtype=np.float32),
+            np.asarray(feeds["state"], dtype=np.float32) + 1.0,
+        ]
+
+
+@pytest.fixture
+def make_silero(monkeypatch):
+    """Factory for a started SileroVad wired to a fake ONNX session; the
+    fixture stops every started decider so no worker thread leaks."""
+    started: list = []
+
+    def _make(prob: float):
+        fake = _FakeSileroSession(prob)
+        monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
+        monkeypatch.setattr(engine, "_ensure_onnxruntime", lambda: True)
+        monkeypatch.setattr(engine, "_create_silero_session", lambda path: fake)
+        vad = engine.SileroVad().start()
+        started.append(vad)
+        return vad, fake
+
+    yield _make
+    for vad in started:
+        vad.stop()
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    """Poll `predicate` until true or timeout — the worker thread is async."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_silero_speech_probability_turns_speech_on(make_silero):
+    """Fake session says speech (prob ≥ onset) → is_speech() flips True even on
+    a silent block: with the model active, the model decides, not the energy."""
+    vad, fake = make_silero(0.9)
+    quiet = np.zeros(engine.BLOCKSIZE, dtype=np.float32)
+
+    assert vad.is_speech() is False
+    vad.submit(quiet, rms=0.0)
+    vad.submit(quiet, rms=0.0)
+
+    assert _wait_until(vad.is_speech), "worker never published a speech decision"
+    # Re-chunk contract: 2×1600 samples = exactly 6 full 512-frames (+128 carry)…
+    assert _wait_until(lambda: len(fake.feeds) == 6), "worker did not re-chunk 2 blocks into 6 frames"
+    for i, feed in enumerate(fake.feeds):
+        # …each fed as context (64) + frame (512) at 16 kHz — the v5 model contract.
+        assert feed["input"].shape == (1, engine.SILERO_CONTEXT + engine.SILERO_FRAME)
+        assert int(feed["sr"]) == engine.SAMPLE_RATE
+        # Recurrent state: call i must receive the state produced by call i-1.
+        assert feed["state"].shape == (2, 1, 128)
+        assert feed["state"] == pytest.approx(np.full((2, 1, 128), float(i)))
+
+
+def test_silero_music_high_rms_low_prob_is_not_speech(make_silero):
+    """Music: a block well above VAD_THRESHOLD but the model says non-speech →
+    is_speech() stays False (the legacy energy VAD alone would have fired)."""
+    vad, fake = make_silero(0.1)
+    loud = np.full(engine.BLOCKSIZE, 0.5, dtype=np.float32)
+    rms = 0.5
+    assert rms >= engine.VAD_THRESHOLD  # sanity: the legacy threshold would say speech
+
+    vad.submit(loud, rms=rms)
+    assert _wait_until(lambda: len(fake.feeds) >= 3), "worker never consumed the block"
+    assert vad.is_speech() is False
+
+
+def test_silero_absent_is_bit_identical_to_rms_threshold(monkeypatch):
+    """onnxruntime unavailable → the decider degrades to the energy threshold:
+    is_speech() == (rms >= VAD_THRESHOLD) after every submit, exactly as today."""
+    monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
+    monkeypatch.setattr(engine, "_ensure_onnxruntime", lambda: False)
+    vad = engine.SileroVad().start()
+    assert vad._worker is None  # no ONNX → no worker thread at all
+
+    block = np.zeros(engine.BLOCKSIZE, dtype=np.float32)
+    t = engine.VAD_THRESHOLD
+    for rms in (0.0, t / 2, float(np.nextafter(t, 0.0)), t,
+                float(np.nextafter(t, 1.0)), 2 * t, 0.5, 1.0):
+        vad.submit(block, rms=rms)
+        assert vad.is_speech() is (rms >= t), f"fallback drifted from threshold at rms={rms}"
 
 
 # ── WAV encoding for Whisper (16 kHz / 16-bit / mono) ─────────────────────────
