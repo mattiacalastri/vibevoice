@@ -132,13 +132,89 @@ def test_unmuted_engine_starts_recording_on_speech(engine_state):
     assert engine.STATE_FILE.read_text() == "recording"
 
 
-# ── Capture backend seam (F1: selection point for voice-processing capture) ───
+# ── Capture backend seam (F1: voice-processing capture + sounddevice fallback) ─
 
-def test_default_capture_backend_is_sounddevice():
-    """The seam must select sounddevice until the voice-processing backend lands."""
+def test_capture_backend_falls_back_without_avfoundation(monkeypatch):
+    """AVFoundation unavailable → the seam must select sounddevice."""
+    monkeypatch.setattr(engine, "VP_ENABLED", True)
+    monkeypatch.setattr(engine, "_ensure_avfoundation", lambda: False)
     backend = engine._select_capture_backend()
     assert backend is engine._SounddeviceCapture
     assert backend.name == "sounddevice"
+
+
+def test_capture_backend_prefers_voice_processing(monkeypatch):
+    """AVFoundation available + VIBEVOICE_VP on → voice-processing is selected."""
+    monkeypatch.setattr(engine, "VP_ENABLED", True)
+    monkeypatch.setattr(engine, "_ensure_avfoundation", lambda: True)
+    backend = engine._select_capture_backend()
+    assert backend is engine._VoiceProcessingCapture
+    assert backend.name == "voice-processing"
+
+
+def test_vp_env_kill_switch_forces_sounddevice(monkeypatch):
+    """VIBEVOICE_VP=0 must force sounddevice even when AVFoundation imports."""
+    monkeypatch.setattr(engine, "VP_ENABLED", False)
+    monkeypatch.setattr(engine, "_ensure_avfoundation", lambda: True)
+    assert engine._select_capture_backend() is engine._SounddeviceCapture
+
+
+def test_selection_survives_avfoundation_import_failure(monkeypatch, capsys):
+    """Simulate a machine WITHOUT pyobjc-framework-AVFoundation: the real
+    _ensure_avfoundation() must swallow the ImportError, print the install
+    hint, and the seam must degrade to sounddevice (criterio 'è fatto' F1)."""
+    import sys as _sys
+    monkeypatch.setattr(engine, "_AVF", None)
+    monkeypatch.setattr(engine, "_AVF_AVAILABLE", None)      # reset tri-state cache
+    monkeypatch.setitem(_sys.modules, "AVFoundation", None)  # import → ImportError
+    monkeypatch.setattr(engine, "VP_ENABLED", True)
+
+    assert engine._ensure_avfoundation() is False
+    assert engine._select_capture_backend() is engine._SounddeviceCapture
+    assert "pyobjc-framework-AVFoundation" in capsys.readouterr().err
+
+
+def test_run_falls_back_to_sounddevice_when_vp_open_fails(engine_state, monkeypatch, capsys):
+    """A VP backend that raises at open time (mic permission, API error) must
+    not kill the engine: run() logs the failure and retries via sounddevice."""
+    class _BoomCapture:
+        name = "voice-processing"
+
+        def __init__(self, callback):
+            pass
+
+        def __enter__(self):
+            raise RuntimeError("AVAudioEngine start failed")
+
+        def __exit__(self, *exc):
+            return False
+
+    opened = {}
+
+    class _FakeSounddevice:
+        name = "sounddevice"
+
+        def __init__(self, callback):
+            opened["callback"] = callback
+
+        def __enter__(self):
+            opened["entered"] = True
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(engine, "_select_capture_backend", lambda: _BoomCapture)
+    monkeypatch.setattr(engine, "_SounddeviceCapture", _FakeSounddevice)
+    eng = engine.Engine()
+    eng.stop()  # loop exits right after the stream opens — no blocking in CI
+    eng.run()
+
+    err = capsys.readouterr().err
+    assert opened["entered"] is True
+    assert opened["callback"] == eng._audio_callback
+    assert "falling back to sounddevice" in err
+    assert "capture: sounddevice" in err
 
 
 def test_run_opens_capture_via_seam_and_logs_backend(engine_state, monkeypatch, capsys):

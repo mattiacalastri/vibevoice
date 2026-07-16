@@ -18,7 +18,7 @@ vibevoice/
 ├── CLAUDE.md                     # short agent rules → points here
 ├── AGENTS.md                     # this file: the engineering contract
 ├── README.md                     # human-facing intro, install, troubleshooting
-├── requirements.txt              # pyobjc, mlx-whisper, sounddevice, numpy
+├── requirements.txt              # pyobjc (+AVFoundation), mlx-whisper, sounddevice, numpy
 ├── pyproject.toml                # ruff + pytest config (no [project]: it's an app, not a package)
 ├── LICENSE                       # MIT
 ├── com.vibevoice.pill.plist      # LaunchAgent template for the pill   (replace __HOME__)
@@ -157,7 +157,7 @@ not just this engine.
 ## 5. Run & develop
 
 ```bash
-pip install -r requirements.txt        # pyobjc, mlx-whisper, sounddevice, numpy
+pip install -r requirements.txt        # pyobjc (+AVFoundation), mlx-whisper, sounddevice, numpy
 pip install pynput                     # only needed for autosend.py
 
 python3 vibevoice.py                   # live pill (reads engine state files)
@@ -177,6 +177,7 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_MODEL` | `mlx-community/whisper-turbo` | mlx_whisper model id (downloaded on first use) |
 | `VIBEVOICE_AUTOSEND` | `1` | paste transcription into frontmost app |
 | `VIBEVOICE_AUTOSEND_RETURN` | `0` | press Return after pasting |
+| `VIBEVOICE_VP` | `1` | capture via macOS voice processing (AVAudioEngine + Apple AEC/NS/AGC — the full-duplex prerequisite); `0` forces sounddevice. Auto-falls back to sounddevice when AVFoundation is missing or the VP path fails at open time |
 
 ### Environment variables (pill)
 | Var | Default | Meaning |

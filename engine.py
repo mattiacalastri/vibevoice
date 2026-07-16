@@ -50,9 +50,14 @@
 #   VIBEVOICE_MODEL           mlx_whisper model (default: mlx-community/whisper-turbo)
 #   VIBEVOICE_AUTOSEND        "1" to paste into frontmost app (default: "1")
 #   VIBEVOICE_AUTOSEND_RETURN "1" to press Return after pasting (default: "0")
+#   VIBEVOICE_VP              "1" to capture via macOS voice processing (Apple
+#                             AEC/NS/AGC — the full-duplex prerequisite);
+#                             "0" forces sounddevice (default: "1"; any
+#                             voice-processing failure falls back to sounddevice)
 # ---------------------------------------------------------------------------
 
 import os
+import queue
 import struct
 import sys
 import tempfile
@@ -92,6 +97,7 @@ LANG = os.environ.get("VIBEVOICE_LANG", "it")
 MODEL = os.environ.get("VIBEVOICE_MODEL", "mlx-community/whisper-turbo")
 AUTOSEND = os.environ.get("VIBEVOICE_AUTOSEND", "1") == "1"
 AUTOSEND_RETURN = os.environ.get("VIBEVOICE_AUTOSEND_RETURN", "0") == "1"
+VP_ENABLED = os.environ.get("VIBEVOICE_VP", "1") == "1"  # macOS voice-processing capture
 
 SAMPLE_RATE = 16000     # mlx_whisper expects 16 kHz mono
 CHANNELS = 1
@@ -349,12 +355,216 @@ class _SounddeviceCapture:
         return stream.__exit__(exc_type, exc, tb)
 
 
+# AVFoundation is optional (same lazy pattern as _ensure_mlx_whisper): without
+# it the engine still runs on sounddevice, just without Apple echo cancellation.
+_AVF = None            # lazily imported AVFoundation module
+_AVF_AVAILABLE = None  # tri-state: None=unknown, True/False once checked
+
+
+def _ensure_avfoundation() -> bool:
+    """Import AVFoundation lazily. Returns True if available, else prints help."""
+    global _AVF, _AVF_AVAILABLE
+    if _AVF_AVAILABLE is not None:
+        return _AVF_AVAILABLE
+    try:
+        import AVFoundation  # type: ignore
+        _AVF = AVFoundation
+        _AVF_AVAILABLE = True
+    except Exception as err:
+        _AVF_AVAILABLE = False
+        sys.stderr.write(
+            "VibeVoice: 'AVFoundation' (PyObjC) is not available — "
+            "voice-processing capture disabled, using sounddevice.\n"
+            "For Apple echo cancellation (full-duplex) install it with:\n"
+            "    pip install pyobjc-framework-AVFoundation\n"
+            f"Import error: {err}\n"
+        )
+    return _AVF_AVAILABLE
+
+
+class _VoiceProcessingCapture:
+    """Microphone capture via AVAudioEngine with Apple voice processing.
+
+    Enabling voice processing on the input node (strictly BEFORE the engine
+    starts) turns on the AEC/NS/AGC stack FaceTime uses: the Mac's own speaker
+    output is subtracted from the mic signal at the source — the prerequisite
+    for full-duplex operation.
+
+    Same contract as _SounddeviceCapture: `callback` receives float32 mono
+    blocks of BLOCKSIZE samples at SAMPLE_RATE with the sounddevice signature
+    (indata, frames, time_info, status), indata shaped (N, 1).
+
+    Threading: the tap block runs on a CoreAudio thread, so the Python work
+    there is strictly copy + enqueue (holding the GIL longer would starve the
+    audio HAL). Resampling (AVAudioConverter, native rate → 16 kHz mono) and
+    the VAD callback run on a dedicated worker thread.
+    """
+
+    name = "voice-processing"
+
+    _TAP_BUFSIZE = 4096   # frames per tap buffer (advisory; CoreAudio may pick its own)
+    _QUEUE_MAX = 64       # tap→worker backlog cap; beyond this, blocks are dropped
+
+    def __init__(self, callback) -> None:
+        self._callback = callback
+        self._queue: queue.Queue = queue.Queue(maxsize=self._QUEUE_MAX)
+        self._stopping = threading.Event()
+        self._engine = None
+        self._node = None
+        self._worker: threading.Thread | None = None
+        self._converter = None
+        self._in_fmt = None    # mono, native VP sample rate (24/48 kHz)
+        self._out_fmt = None   # mono, SAMPLE_RATE
+        self._in_rate = 0.0
+
+    def __enter__(self) -> "_VoiceProcessingCapture":
+        if not _ensure_avfoundation():
+            raise RuntimeError("AVFoundation is not importable")
+        AVF = _AVF
+        self._engine = AVF.AVAudioEngine.alloc().init()
+        self._node = self._engine.inputNode()
+        # Must happen BEFORE start: enabling VP restructures the input HW path.
+        ok, err = self._node.setVoiceProcessingEnabled_error_(True, None)
+        if not ok:
+            raise RuntimeError(f"setVoiceProcessingEnabled failed: {err}")
+        native = self._node.outputFormatForBus_(0)
+        rate = float(native.sampleRate())
+        if rate <= 0 or int(native.channelCount()) < 1:
+            raise RuntimeError(f"unusable voice-processing input format: {native}")
+        self._in_rate = rate
+        # The converter sees mono: the tap copies only channel 0 (the processed
+        # voice channel — VP formats can be multichannel, e.g. 9ch deinterleaved).
+        self._in_fmt = AVF.AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(
+            AVF.AVAudioPCMFormatFloat32, rate, 1, False)
+        self._out_fmt = AVF.AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(
+            AVF.AVAudioPCMFormatFloat32, float(SAMPLE_RATE), 1, False)
+        self._converter = AVF.AVAudioConverter.alloc().initFromFormat_toFormat_(
+            self._in_fmt, self._out_fmt)
+        if self._converter is None:
+            raise RuntimeError(f"AVAudioConverter init failed ({rate} Hz -> {SAMPLE_RATE} Hz)")
+
+        q = self._queue
+
+        def _tap(buf, _when) -> None:
+            # CoreAudio thread: copy channel 0 + enqueue, nothing else.
+            try:
+                frames = int(buf.frameLength())
+                if frames:
+                    q.put_nowait(bytes(buf.floatChannelData()[0].as_buffer(frames)))
+            except Exception:
+                pass  # full queue or teardown race — drop the block, never raise
+
+        self._node.installTapOnBus_bufferSize_format_block_(0, self._TAP_BUFSIZE, native, _tap)
+        try:
+            self._engine.prepare()
+            ok, err = self._engine.startAndReturnError_(None)
+            if not ok:
+                raise RuntimeError(f"AVAudioEngine start failed: {err}")
+        except Exception:
+            self._node.removeTapOnBus_(0)
+            raise
+        self._worker = threading.Thread(
+            target=self._drain, name="vp-capture-drain", daemon=True
+        )
+        self._worker.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._node is not None:
+                self._node.removeTapOnBus_(0)
+            if self._engine is not None:
+                self._engine.stop()
+        except Exception:
+            pass
+        self._stopping.set()
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.join(timeout=2.0)
+        return False
+
+    # -- worker thread ---------------------------------------------------------
+
+    def _drain(self) -> None:
+        """Dequeue native-rate blocks, resample to 16 kHz, regroup to BLOCKSIZE."""
+        import objc  # pyobjc-core; guaranteed present when AVFoundation imported
+        AVF = _AVF
+        pending = np.zeros(0, dtype=np.float32)
+        in_buf = None
+        in_capacity = 0
+        while not self._stopping.is_set():
+            try:
+                data = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                with objc.autorelease_pool():
+                    chunk = np.frombuffer(data, dtype=np.float32)
+                    n = int(chunk.size)
+                    if n == 0:
+                        continue
+                    if in_buf is None or n > in_capacity:
+                        in_capacity = max(n, self._TAP_BUFSIZE)
+                        in_buf = AVF.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
+                            self._in_fmt, in_capacity)
+                    np.frombuffer(
+                        in_buf.floatChannelData()[0].as_buffer(n), dtype=np.float32
+                    )[:] = chunk
+                    in_buf.setFrameLength_(n)
+                    pending = np.concatenate([pending, self._convert(in_buf, n)])
+                while pending.size >= BLOCKSIZE:
+                    block, pending = pending[:BLOCKSIZE], pending[BLOCKSIZE:]
+                    self._callback(block.reshape(-1, 1), BLOCKSIZE, None, None)
+            except Exception:
+                continue  # one bad block must not kill the capture path
+
+    def _convert(self, in_buf, frames: int) -> np.ndarray:
+        """Push one mono native-rate buffer through the converter, pull all output.
+
+        The converter keeps SRC filter state across calls (it is created once per
+        session), so a little latency at the start is expected and the sample
+        stream stays continuous.
+        """
+        AVF = _AVF
+        out_capacity = int(frames * SAMPLE_RATE / self._in_rate) + 64
+        fed = [False]
+
+        def _feed(_num_packets, _out_status):
+            # PyObjC bridges the AVAudioConverterInputStatus* out-param as a
+            # tuple return: (buffer, status).
+            if fed[0]:
+                return (None, AVF.AVAudioConverterInputStatus_NoDataNow)
+            fed[0] = True
+            return (in_buf, AVF.AVAudioConverterInputStatus_HaveData)
+
+        out: list[np.ndarray] = []
+        while True:
+            out_buf = AVF.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
+                self._out_fmt, out_capacity)
+            status, _err = self._converter.convertToBuffer_error_withInputFromBlock_(
+                out_buf, None, _feed)
+            got = int(out_buf.frameLength())
+            if got:
+                out.append(np.frombuffer(
+                    out_buf.floatChannelData()[0].as_buffer(got), dtype=np.float32
+                ).copy())  # copy: the array must outlive out_buf
+            if status != AVF.AVAudioConverterOutputStatus_HaveData or got == 0:
+                break  # InputRanDry (normal) / EndOfStream / Error — done for now
+        if not out:
+            return np.zeros(0, dtype=np.float32)
+        return out[0] if len(out) == 1 else np.concatenate(out)
+
+
 def _select_capture_backend() -> type:
     """Pick the capture backend class.
 
-    Today: sounddevice only. F1 will try the macOS voice-processing backend
-    first (AEC/NS/AGC via AVAudioEngine) and fall back here.
+    Prefers the macOS voice-processing backend (Apple AEC/NS/AGC — the
+    full-duplex prerequisite) unless VIBEVOICE_VP=0 or AVFoundation is not
+    importable. Failures later, at open time (mic permission, API errors),
+    fall back to sounddevice inside Engine.run().
     """
+    if VP_ENABLED and _ensure_avfoundation():
+        return _VoiceProcessingCapture
     return _SounddeviceCapture
 
 
@@ -398,12 +608,21 @@ class Engine:
         write_state("idle")
         write_levels(self._rms_history)
         backend_cls = _select_capture_backend()
-        sys.stderr.write(f"VibeVoice: capture: {backend_cls.name}\n")
+        if backend_cls is not _SounddeviceCapture:
+            # Voice-processing (or an injected backend) first. Whatever fails
+            # at open time — mic permission, VP API errors — degrades to
+            # sounddevice below instead of killing the engine.
+            try:
+                self._capture_loop(backend_cls)
+                write_state("idle")
+                return
+            except Exception as err:
+                sys.stderr.write(
+                    f"VibeVoice: capture '{backend_cls.name}' failed ({err}); "
+                    "falling back to sounddevice.\n"
+                )
         try:
-            with backend_cls(self._audio_callback):
-                # Block here; the callback drives all the work.
-                while not self._stop.is_set():
-                    self._stop.wait(0.25)
+            self._capture_loop(_SounddeviceCapture)
         except Exception as err:
             sys.stderr.write(
                 "VibeVoice: could not open the microphone.\n"
@@ -414,6 +633,13 @@ class Engine:
             write_state("idle")
             return
         write_state("idle")
+
+    def _capture_loop(self, backend_cls: type) -> None:
+        """Open `backend_cls` and block until stop() — the callback drives all work."""
+        sys.stderr.write(f"VibeVoice: capture: {backend_cls.name}\n")
+        with backend_cls(self._audio_callback):
+            while not self._stop.is_set():
+                self._stop.wait(0.25)
 
     def stop(self) -> None:
         """Signal the capture loop to exit."""

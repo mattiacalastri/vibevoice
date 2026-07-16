@@ -1,4 +1,5 @@
 pyobjc
+pyobjc-framework-AVFoundation
 mlx-whisper
 sounddevice
 numpy
