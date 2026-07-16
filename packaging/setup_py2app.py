@@ -30,12 +30,18 @@ OPTIONS = {
     # discovery, following the actual import graph) is enough to ship it
     # without forcing in its unused optional heavyweight dependencies.
     "packages": ["numpy", "sounddevice"],
-    "includes": ["objc", "AppKit", "Foundation", "Quartz", "config", "mlx_whisper"],
+    # AVFoundation: the F1 voice-processing capture imports it lazily
+    # (engine._ensure_avfoundation), so modulegraph never sees it — include it
+    # explicitly like the other pyobjc frameworks.
+    "includes": ["objc", "AppKit", "Foundation", "Quartz", "AVFoundation", "config", "mlx_whisper"],
     # This Mac's system site-packages is polluted with heavyweight ML backends
     # (torch, jax, onnxruntime, PyInstaller, ...) that mlx_whisper's transitive
     # graph can reach but never needs at runtime. modulegraph crashes scanning
     # PyInstaller's dashed hook filenames (`hook-PySide2.QtWebEngine` is not an
     # importable module name), so cut the whole cluster out of the scan.
+    # onnxruntime IS needed at runtime by the F2 Silero decider, but it stays
+    # in this exclude list deliberately (anti-crash): build_release.sh grafts
+    # the real package post-build, same pattern as mlx/tiktoken.
     "excludes": [
         "PyInstaller",
         "torch",
