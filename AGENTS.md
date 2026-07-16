@@ -240,6 +240,65 @@ still verified behaviorally. After any change, also exercise the path you touche
   `test_full_run_without_avfoundation_captures_via_sounddevice`). If you touch the
   decider or a capture backend, those tests must stay green unmodified — a machine
   without the optional deps must behave exactly like the pre-full-duplex engine.
+- **Full-duplex changes (VP capture / Silero decider)** → run the barge-in
+  acceptance procedure below on the live runtime.
+
+### End-to-end acceptance: barge-in with open speakers (the full-duplex criterion)
+
+The definitive behavioral check for the full-duplex jump. It runs on the **live
+runtime** — never in pytest (tests must not touch `~/.vibevoice/`, CLAUDE.md rule 2)
+— and it needs a human voice at the mic: the barge-in phrase cannot be automated,
+because anything played through the speakers is exactly what Apple's AEC is there to
+cancel. Success = the engine transcribes *you* while the Mac is talking/playing, and
+transcribes *nothing* when only the Mac is talking/playing. The judge is
+`~/.vibevoice/history.jsonl` (one JSONL line per utterance, newest last).
+
+```bash
+# 0. Legacy engine OFF for the whole test (the namesake trap in CLAUDE.md — it
+#    fights over the mic). Expected: no output, exit code 1. If it is running,
+#    stop it first: launchctl bootout gui/$UID/com.vibevoice.dictation
+#    (and re-enable it after the test — it is the daily driver).
+pgrep -f stt_bar.py
+
+# 1. Engine up with VP + Silero. Both prove themselves on stderr at startup —
+#    do not proceed until you have seen BOTH lines:
+#      VibeVoice: capture: voice-processing
+#      VibeVoice: VAD: silero (…/silero_vad.onnx)
+VIBEVOICE_AUTOSEND=0 python3 engine.py   # autosend off: the test only observes
+                                         # history.jsonl, nothing gets pasted mid-run
+
+# 2. Baseline. history.jsonl caps at HISTORY_MAX=20 — if L0 is already 20 the
+#    "+1" below saturates; judge by `tail -1` (ts + text) instead.
+L0=$(wc -l < ~/.vibevoice/history.jsonl 2>/dev/null || echo 0)
+
+# 3. TTS-only — ~30 s of spoken TTS from the speakers, nobody talks:
+say -o /tmp/vv_tts.aiff "$(printf 'Questa è una prova di sintesi vocale del sistema. %.0s' {1..12})"
+afplay /tmp/vv_tts.aiff
+wc -l < ~/.vibevoice/history.jsonl       # expected: == L0 (AEC ate the far-end audio)
+
+# 4. Barge-in — replay the TTS and SPEAK a phrase over it while it plays
+#    (e.g. "il polpo ha otto tentacoli"):
+afplay /tmp/vv_tts.aiff &
+wc -l < ~/.vibevoice/history.jsonl       # expected: == L0+1
+tail -1 ~/.vibevoice/history.jsonl       # expected: contains the phrase you spoke
+
+# 5. Music-only — ~30 s of music from the speakers, nobody talks:
+afplay /path/to/music.mp3                # any ~30 s instrumental clip
+wc -l < ~/.vibevoice/history.jsonl       # expected: still == L0+1, no spurious utterance
+
+# 6. Legacy still off (nothing resurrected it mid-test). Expected: 1.
+pgrep -f stt_bar.py; echo $?
+```
+
+Triage when a step fails: step 3 grows the file → the capture backend is not
+cancelling the speaker signal; re-check the startup stderr really said
+`voice-processing` (with `VIBEVOICE_VP=0` or a silent fallback you are on
+sounddevice, where TTS *will* leak into the mic). Step 4 doesn't grow it → speak
+louder/closer, then look at `SILERO_*` thresholds. Step 5 grows it → the decider is
+letting music through; verify `VAD: silero` was on stderr (the RMS fallback fires on
+any loud audio, music included — that is expected degraded behavior, not a bug).
+The command sequence above is locked by `test_agents_documents_barge_in_acceptance`
+in `tests/test_contract.py` so doc and ritual cannot drift.
 
 Style: the repo is `ruff`-clean (a `.ruff_cache` is present). Run `ruff check .` if
 available and keep it green. Match the existing comment density — the code favors short

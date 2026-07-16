@@ -17,6 +17,7 @@ import struct
 import time
 import wave
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -653,3 +654,34 @@ def test_history_appends_and_caps(history_state):
 def test_history_write_failure_never_raises(history_state, monkeypatch):
     monkeypatch.setattr(engine, "HISTORY_FILE", history_state / "no" / "dir.jsonl")
     engine._append_history("must not raise")  # transcription path must survive
+
+
+# ── AGENTS.md §6: the barge-in acceptance procedure is documented ─────────────
+#
+# The end-to-end criterion for the full-duplex jump (TTS-only / barge-in /
+# music-only, judged on history.jsonl) runs on the LIVE runtime with a human
+# voice at the mic — never in pytest (CLAUDE.md rule 2). What CAN be locked
+# headless is that the ritual exists in AGENTS.md §6 with its measurable
+# commands, so the doc and the runtime procedure cannot drift apart.
+
+def _agents_section_6() -> str:
+    text = (Path(engine.__file__).parent / "AGENTS.md").read_text()
+    return text[text.index("## 6."):text.index("## 7.")]
+
+
+def test_agents_documents_barge_in_acceptance():
+    sec = _agents_section_6()
+    low = sec.lower()
+    # The three phases, by name.
+    assert "tts-only" in low
+    assert "barge-in" in low
+    assert "music" in low
+    # The measurable commands the criterion is judged by.
+    assert "pgrep -f stt_bar.py" in sec              # legacy engine off → exit 1
+    assert "L0=$(wc -l < ~/.vibevoice/history.jsonl" in sec
+    assert "L0+1" in sec                             # barge-in grows it by one…
+    assert "tail -1" in sec                          # …and the phrase is the last line
+    assert "afplay" in sec                           # speakers open during the test
+    # Measurable startup evidence that VP + Silero are the active paths.
+    assert "VibeVoice: capture: voice-processing" in sec
+    assert "VibeVoice: VAD: silero" in sec
