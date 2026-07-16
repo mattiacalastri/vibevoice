@@ -347,6 +347,56 @@ def test_silero_absent_is_bit_identical_to_rms_threshold(monkeypatch):
         assert vad.is_speech() is (rms >= t), f"fallback drifted from threshold at rms={rms}"
 
 
+class _ExplodingSileroSession(_FakeSileroSession):
+    """_FakeSileroSession that raises after `explode_after` successful frames —
+    drives the mid-stream inference-failure branch of SileroVad._run."""
+
+    def __init__(self, prob: float, explode_after: int) -> None:
+        super().__init__(prob)
+        self.explode_after = explode_after
+
+    def run(self, _output_names, feeds):
+        if len(self.feeds) >= self.explode_after:
+            raise RuntimeError("mid-stream inference failure")
+        return super().run(_output_names, feeds)
+
+
+def test_silero_midstream_failure_degrades_to_rms_fallback(monkeypatch, capsys):
+    """Inference raising mid-stream (SileroVad._run's except branch): the
+    decider must flip to the RMS fallback (_active=False) instead of freezing
+    the last neural decision — the second leg of the ARCHITECTURE.md §2.3
+    degradation contract (the onnxruntime-absent leg is locked by
+    test_full_flow_without_onnxruntime_behaves_like_legacy)."""
+    fake = _ExplodingSileroSession(prob=0.9, explode_after=3)
+    monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
+    monkeypatch.setattr(engine, "_ensure_onnxruntime", lambda: True)
+    monkeypatch.setattr(engine, "_create_silero_session", lambda path: fake)
+    vad = engine.SileroVad().start()
+    try:
+        worker = vad._worker
+        quiet = np.zeros(engine.BLOCKSIZE, dtype=np.float32)
+
+        # Healthy stretch: the model (prob ≥ onset) decides speech on silence
+        # (one 1600-sample block = exactly explode_after=3 successful frames).
+        vad.submit(quiet, rms=0.0)
+        assert _wait_until(vad.is_speech), "model never published speech pre-failure"
+
+        # The next frame raises inside the worker → degrade, announce, stop.
+        vad.submit(quiet, rms=0.0)
+        assert _wait_until(lambda: not worker.is_alive()), "worker survived the failure"
+        assert vad._active is False
+        assert "falling back to the RMS threshold" in capsys.readouterr().err
+
+        # From here on the decision is exactly the energy threshold again: the
+        # stale neural True must not leak through (frozen-decision scar).
+        t = engine.VAD_THRESHOLD
+        for rms in (0.0, t / 2, t, 2 * t):
+            vad.submit(quiet, rms=rms)
+            assert vad.is_speech() is (rms >= t), f"fallback drifted at rms={rms}"
+    finally:
+        vad.stop()
+
+
 # ── Decider wired into the audio callback (F2, task 4) ────────────────────────
 
 @pytest.fixture

@@ -96,8 +96,9 @@ flap.
 **Degradation contract**: without `onnxruntime` or a model (`_resolve_silero_model`
 cascade: `VIBEVOICE_SILERO_MODEL` env path → `silero_vad` package data → None), or after
 a mid-stream inference failure, `is_speech()` returns `rms >= VAD_THRESHOLD` —
-bit-identical to the legacy energy VAD (locked by
-`test_full_flow_without_onnxruntime_behaves_like_legacy`). The raw RMS keeps feeding
+bit-identical to the legacy energy VAD (the missing-dependency leg is locked by
+`test_full_flow_without_onnxruntime_behaves_like_legacy`, the mid-stream failure leg by
+`test_silero_midstream_failure_degrades_to_rms_fallback`). The raw RMS keeps feeding
 `levels.bin` regardless of who decides — the waveform is capture-driven, not
 decision-driven.
 

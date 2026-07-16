@@ -53,9 +53,24 @@ echo "── graft: Silero VAD model (op15 16k variant when equivalent) ──"
 # silence→speech→silence sweep AND identical SILERO_ONSET/SILERO_OFFSET
 # hysteresis gate decisions. Any doubt or error → ship the full model.
 python3 - "$BUNDLE_LIB" <<'PYEOF'
-import importlib.util, os, shutil, sys
+import ast, importlib.util, os, shutil, sys
 import numpy as np
 bundle = sys.argv[1]
+
+# Hysteresis thresholds: read SILERO_ONSET/SILERO_OFFSET from engine.py (the
+# single source of truth) — a literal copy here would keep silently validating
+# the OLD gates if the engine constants ever change. Parsed via AST, not
+# imported: importing engine.py would touch ~/.vibevoice/ at build time.
+gates = {}
+for node in ast.walk(ast.parse(open("engine.py").read())):
+    if (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("SILERO_ONSET", "SILERO_OFFSET")):
+        gates[node.targets[0].id] = ast.literal_eval(node.value)
+if set(gates) != {"SILERO_ONSET", "SILERO_OFFSET"}:
+    sys.exit(f"graft: SILERO_ONSET/SILERO_OFFSET not found in engine.py ({gates})")
+onset, offset = gates["SILERO_ONSET"], gates["SILERO_OFFSET"]
+
 spec = importlib.util.find_spec("silero_vad")
 if spec is None or not spec.origin:
     sys.exit("graft: cannot locate package silero_vad on the build machine")
@@ -97,8 +112,8 @@ if os.path.exists(op15):
     try:
         a, b = probs(full), probs(op15)
         same_probs = float(np.abs(a - b).max()) <= 1e-4
-        same_gates = bool(((a >= 0.5) == (b >= 0.5)).all()       # SILERO_ONSET
-                          and ((a <= 0.35) == (b <= 0.35)).all())  # SILERO_OFFSET
+        same_gates = bool(((a >= onset) == (b >= onset)).all()
+                          and ((a <= offset) == (b <= offset)).all())
         if same_probs and same_gates:
             chosen = op15
         else:

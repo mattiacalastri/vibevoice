@@ -828,7 +828,6 @@ class Engine:
                 # sounddevice below instead of killing the engine.
                 try:
                     self._capture_loop(backend_cls)
-                    write_state("idle")
                     return
                 except Exception as err:
                     sys.stderr.write(
@@ -844,10 +843,10 @@ class Engine:
                     "> Microphone, then retry.\n"
                     f"Audio error: {err}\n"
                 )
-                write_state("idle")
-                return
-            write_state("idle")
         finally:
+            # Single exit point: every path out of run() (clean stop, capture
+            # failure, propagated error) leaves the state file at "idle".
+            write_state("idle")
             self._vad.stop()
 
     def _capture_loop(self, backend_cls: type) -> None:

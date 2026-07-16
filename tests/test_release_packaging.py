@@ -79,6 +79,21 @@ def test_release_grafts_exactly_one_silero_model():
     )
 
 
+def test_release_equivalence_gate_reads_thresholds_from_engine():
+    """The op15-vs-full gate must source SILERO_ONSET/SILERO_OFFSET from
+    engine.py instead of duplicating the literals: a hardcoded 0.5/0.35 would
+    silently keep validating the OLD hysteresis if the engine constants change."""
+    assert '"SILERO_ONSET"' in RELEASE and '"SILERO_OFFSET"' in RELEASE, (
+        "equivalence gate no longer reads the hysteresis thresholds from engine.py"
+    )
+    assert "(a >= onset) == (b >= onset)" in RELEASE, (
+        "onset gate comparison must use the value read from engine.py"
+    )
+    assert "(a <= offset) == (b <= offset)" in RELEASE, (
+        "offset gate comparison must use the value read from engine.py"
+    )
+
+
 def test_release_purges_partial_zip_shadows():
     """The zip's partial tiktoken AND mlx must be purged: the synthesized
     REGULAR mlx package in the zip (stub __init__.pyc, missing _reprlib_fix)
