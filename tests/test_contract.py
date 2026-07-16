@@ -346,6 +346,125 @@ def test_silero_absent_is_bit_identical_to_rms_threshold(monkeypatch):
         assert vad.is_speech() is (rms >= t), f"fallback drifted from threshold at rms={rms}"
 
 
+# ── Decider wired into the audio callback (F2, task 4) ────────────────────────
+
+@pytest.fixture
+def arm_engine_decider(monkeypatch):
+    """Arm an Engine's own decider with a fake ONNX session (same seams as
+    make_silero, but started on `eng._vad` so the callback wiring is exercised);
+    stops every armed decider so no worker thread leaks."""
+    armed: list = []
+
+    def _arm(eng, prob: float):
+        fake = _FakeSileroSession(prob)
+        monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
+        monkeypatch.setattr(engine, "_ensure_onnxruntime", lambda: True)
+        monkeypatch.setattr(engine, "_create_silero_session", lambda path: fake)
+        eng._vad.start()
+        armed.append(eng._vad)
+        return fake
+
+    yield _arm
+    for vad in armed:
+        vad.stop()
+
+
+def test_callback_loud_music_not_recorded_when_model_says_nonspeech(
+    engine_state, arm_engine_decider
+):
+    """Music: blocks well above VAD_THRESHOLD but the model says non-speech →
+    the callback must NOT start an utterance. Proves the state machine is
+    driven by the decider's decision, not by the raw RMS threshold."""
+    eng = engine.Engine()
+    fake = arm_engine_decider(eng, prob=0.1)
+    loud = np.full((engine.BLOCKSIZE, 1), 0.5, dtype=np.float32)
+    assert 0.5 >= engine.VAD_THRESHOLD  # sanity: the legacy threshold would fire
+
+    for _ in range(3):
+        eng._audio_callback(loud, engine.BLOCKSIZE, None, None)
+    assert _wait_until(lambda: len(fake.feeds) >= 3), "worker never consumed the blocks"
+    eng._audio_callback(loud, engine.BLOCKSIZE, None, None)  # decision now settled
+
+    assert eng._speaking is False
+
+
+def test_callback_quiet_speech_starts_recording_when_model_says_speech(
+    engine_state, arm_engine_decider
+):
+    """The model hears speech in a block below the RMS threshold → the callback
+    starts recording (with the legacy energy VAD this block was inaudible)."""
+    eng = engine.Engine()
+    arm_engine_decider(eng, prob=0.9)
+    quiet = np.full((engine.BLOCKSIZE, 1), 0.001, dtype=np.float32)
+    assert 0.001 < engine.VAD_THRESHOLD  # sanity: the legacy threshold stays silent
+
+    # Pre-warm: inference is async — let the worker publish "speech" first.
+    eng._vad.submit(quiet[:, 0], rms=0.001)
+    assert _wait_until(eng._vad.is_speech), "worker never published a speech decision"
+
+    eng._audio_callback(quiet, engine.BLOCKSIZE, None, None)
+
+    assert eng._speaking is True
+    assert engine.STATE_FILE.read_text() == "recording"
+
+
+def test_levels_bin_identical_with_neural_vad_on_and_off(engine_state, arm_engine_decider):
+    """Same audio → byte-identical levels.bin with the neural decider on or off:
+    the decider replaces the speech DECISION only; the RMS→levels.bin pipeline
+    must stay untouched (invariant #2)."""
+    rng = np.random.default_rng(9465)
+    blocks = [
+        rng.normal(0.3, 0.05, (engine.BLOCKSIZE, 1)).astype(np.float32)
+        for _ in range(12)
+    ]  # loud enough that BOTH deciders say speech on every block
+
+    def feed_all(eng) -> bytes:
+        for b in blocks:
+            eng._audio_callback(b, engine.BLOCKSIZE, None, None)
+        assert eng._speaking is True  # guard: both paths really recorded
+        return engine.LEVELS_FILE.read_bytes()
+
+    # Neural ON (fake model: always speech; pre-warmed so the async worker
+    # cannot skew the first decisions).
+    eng_on = engine.Engine()
+    arm_engine_decider(eng_on, prob=0.9)
+    eng_on._vad.submit(blocks[0][:, 0], rms=0.5)
+    assert _wait_until(eng_on._vad.is_speech), "worker never published a speech decision"
+    with_neural = feed_all(eng_on)
+
+    engine.LEVELS_FILE.unlink()
+
+    # Neural OFF (unstarted decider → RMS fallback, exactly the legacy path).
+    without_neural = feed_all(engine.Engine())
+
+    assert with_neural == without_neural
+
+
+def test_run_starts_and_stops_the_decider(engine_state, monkeypatch):
+    """Engine.run() must bring the decider up before capture opens and stop its
+    worker on the way out — the callback itself never manages lifecycles."""
+    class _FakeCapture:
+        name = "fake"
+
+        def __init__(self, callback):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(engine, "_select_capture_backend", lambda: _FakeCapture)
+    eng = engine.Engine()
+    calls: list[str] = []
+    monkeypatch.setattr(eng._vad, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(eng._vad, "stop", lambda: calls.append("stop"))
+    eng.stop()  # loop exits right after the stream opens — no blocking in CI
+    eng.run()
+    assert calls == ["start", "stop"]
+
+
 # ── WAV encoding for Whisper (16 kHz / 16-bit / mono) ─────────────────────────
 
 def test_save_wav_format_and_length(tmp_path, monkeypatch):

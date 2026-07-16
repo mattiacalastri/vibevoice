@@ -25,9 +25,9 @@
 # ---------------------------------------------------------------------------
 # engine.py — standalone speech-to-text engine for VibeVoice (macOS).
 #
-# Captures the microphone, detects speech with an energy-based VAD, transcribes
-# with mlx_whisper (Apple Silicon), then optionally pastes the result into the
-# frontmost application.
+# Captures the microphone, decides speech/non-speech with Silero VAD (falling
+# back to an energy threshold), transcribes with mlx_whisper (Apple Silicon),
+# then optionally pastes the result into the frontmost application.
 #
 # It communicates with the companion UI ("the pill") exclusively through three
 # small files in ~/.vibevoice/ (the STATE-FILE CONTRACT below). The engine is
@@ -774,17 +774,23 @@ class SileroVad:
 # ── Audio engine ─────────────────────────────────────────────────────────────
 
 class Engine:
-    """Energy-VAD microphone capture + transcription state machine.
+    """Speech-gated microphone capture + transcription state machine.
 
     Lifecycle: idle -> recording -> transcribing -> idle. The engine writes the
     state-file contract on every transition and streams RMS levels at ~LEVELS_HZ
-    while recording.
+    while recording. The speech/non-speech decision comes from the SileroVad
+    decider (RMS-threshold fallback when the model is unavailable); the RMS
+    keeps feeding levels.bin regardless of who decides.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._busy = threading.Semaphore(2)  # up to two transcriptions in flight — keeps the tail of a long utterance from being dropped while the previous blob is still transcribing
+
+        # Speech decider (F2). Constructed unstarted: until run() calls
+        # start(), is_speech() is exactly the legacy RMS-threshold decision.
+        self._vad = SileroVad()
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -810,32 +816,39 @@ class Engine:
         """Open the microphone and run the capture loop until stopped."""
         write_state("idle")
         write_levels(self._rms_history)
-        backend_cls = _select_capture_backend()
-        if backend_cls is not _SounddeviceCapture:
-            # Voice-processing (or an injected backend) first. Whatever fails
-            # at open time — mic permission, VP API errors — degrades to
-            # sounddevice below instead of killing the engine.
+        # Bring the speech decider up for the whole capture session. start()
+        # never raises: without the model/onnxruntime it stays on the RMS
+        # fallback, and stop() in the finally is idempotent either way.
+        self._vad.start()
+        try:
+            backend_cls = _select_capture_backend()
+            if backend_cls is not _SounddeviceCapture:
+                # Voice-processing (or an injected backend) first. Whatever fails
+                # at open time — mic permission, VP API errors — degrades to
+                # sounddevice below instead of killing the engine.
+                try:
+                    self._capture_loop(backend_cls)
+                    write_state("idle")
+                    return
+                except Exception as err:
+                    sys.stderr.write(
+                        f"VibeVoice: capture '{backend_cls.name}' failed ({err}); "
+                        "falling back to sounddevice.\n"
+                    )
             try:
-                self._capture_loop(backend_cls)
-                write_state("idle")
-                return
+                self._capture_loop(_SounddeviceCapture)
             except Exception as err:
                 sys.stderr.write(
-                    f"VibeVoice: capture '{backend_cls.name}' failed ({err}); "
-                    "falling back to sounddevice.\n"
+                    "VibeVoice: could not open the microphone.\n"
+                    "Grant microphone access in System Settings > Privacy & Security "
+                    "> Microphone, then retry.\n"
+                    f"Audio error: {err}\n"
                 )
-        try:
-            self._capture_loop(_SounddeviceCapture)
-        except Exception as err:
-            sys.stderr.write(
-                "VibeVoice: could not open the microphone.\n"
-                "Grant microphone access in System Settings > Privacy & Security "
-                "> Microphone, then retry.\n"
-                f"Audio error: {err}\n"
-            )
+                write_state("idle")
+                return
             write_state("idle")
-            return
-        write_state("idle")
+        finally:
+            self._vad.stop()
 
     def _capture_loop(self, backend_cls: type) -> None:
         """Open `backend_cls` and block until stop() — the callback drives all work."""
@@ -871,6 +884,12 @@ class Engine:
             block = np.ascontiguousarray(indata[:, 0], dtype=np.float32)
             rms = float(np.sqrt(np.mean(block ** 2))) if block.size else 0.0
             now = time.monotonic()
+            # The speech DECISION comes from the decider: feed + flag read are
+            # non-blocking, never raise, and stay OUTSIDE the lock (the callback
+            # must never block). The RMS keeps feeding _rms_history/levels.bin
+            # below exactly as before — only the decision changed.
+            self._vad.submit(block, rms)
+            speech = self._vad.is_speech()
             do_finalize = False
 
             with self._lock:
@@ -881,8 +900,8 @@ class Engine:
                     self._levels_tick = 0
                     write_levels(self._rms_history)
 
-                if rms >= VAD_THRESHOLD:
-                    # Speech present.
+                if speech:
+                    # Speech present (decider's verdict).
                     if not self._speaking:
                         # Onset: start a new utterance, include the pre-roll.
                         self._speaking = True
