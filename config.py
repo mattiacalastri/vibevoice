@@ -16,7 +16,18 @@ STATE_DIR = Path(os.path.expanduser("~")) / ".vibevoice"
 CONFIG_FILE = STATE_DIR / "config.json"
 CONFIG_TMP = STATE_DIR / "config.json.tmp"
 
-DEFAULTS = {"lang": "it", "autosend": True, "autosend_return": True, "dock": True}
+# Adding a key here is backward compatible by construction: `load()` fills any key
+# missing from an existing config.json with the default below, so no migration is
+# needed. `vp` = macOS voice-processing capture (echo cancellation + noise
+# suppression); it reaches the engine as VIBEVOICE_VP at spawn time. Default on,
+# and a voice-processing failure already falls back to sounddevice (AGENTS.md rule 8).
+DEFAULTS = {
+    "lang": "it",
+    "autosend": True,
+    "autosend_return": True,
+    "dock": True,
+    "vp": True,
+}
 
 
 def load() -> dict:

@@ -32,6 +32,22 @@ def test_corrupt_file_returns_defaults(tmp_path, monkeypatch):
     assert config.load() == config.DEFAULTS
 
 
+def test_existing_config_without_vp_gets_the_default(tmp_path, monkeypatch):
+    """Adding a key must not require a migration: files written before it exist keep working."""
+    _redirect(tmp_path, monkeypatch)
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"lang": "en", "autosend": False, "autosend_return": False, "dock": False}))
+    cfg = config.load()
+    assert cfg["vp"] is True, "a pre-existing config must inherit the vp default"
+    assert cfg["lang"] == "en", "the other values must survive untouched"
+
+
+def test_vp_survives_a_roundtrip(tmp_path, monkeypatch):
+    _redirect(tmp_path, monkeypatch)
+    config.save(dict(config.DEFAULTS, vp=False))
+    assert config.load()["vp"] is False
+
+
 def test_unknown_keys_dropped_known_kept(tmp_path, monkeypatch):
     _redirect(tmp_path, monkeypatch)
     (tmp_path / "config.json").write_text(json.dumps({"lang": "en", "evil": 1}))
