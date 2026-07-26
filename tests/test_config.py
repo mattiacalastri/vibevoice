@@ -48,6 +48,18 @@ def test_vp_survives_a_roundtrip(tmp_path, monkeypatch):
     assert config.load()["vp"] is False
 
 
+def test_save_fills_omitted_keys_instead_of_raising(tmp_path, monkeypatch):
+    """Regression: save() used to demand every key, so adding one armed a KeyError
+    in any caller that built a partial dict (that is exactly what happened to
+    settingsChanged_ when `vp` was introduced)."""
+    _redirect(tmp_path, monkeypatch)
+    config.save({"lang": "en"})                      # deliberately partial
+    cfg = config.load()
+    assert cfg["lang"] == "en"
+    assert cfg["vp"] == config.DEFAULTS["vp"]
+    assert cfg["dock"] == config.DEFAULTS["dock"]
+
+
 def test_unknown_keys_dropped_known_kept(tmp_path, monkeypatch):
     _redirect(tmp_path, monkeypatch)
     (tmp_path / "config.json").write_text(json.dumps({"lang": "en", "evil": 1}))

@@ -39,6 +39,15 @@ def load() -> dict:
 
 
 def save(cfg: dict) -> None:
+    """Persist `cfg` atomically, filling anything it omits from DEFAULTS.
+
+    Symmetric with `load()` on purpose. The previous form — `cfg[k] for k in
+    DEFAULTS` — demanded that every caller be exhaustive, so adding a key here
+    silently armed a KeyError in every caller that built a partial dict. That is
+    a trap for whoever adds the next key, not a useful strictness: the defaults
+    are right here.
+    """
     CONFIG_TMP.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_TMP.write_text(json.dumps({k: cfg[k] for k in DEFAULTS}, indent=2))
+    merged = {k: cfg.get(k, v) for k, v in DEFAULTS.items()}
+    CONFIG_TMP.write_text(json.dumps(merged, indent=2))
     os.replace(CONFIG_TMP, CONFIG_FILE)
