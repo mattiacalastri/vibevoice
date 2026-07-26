@@ -89,6 +89,7 @@ import struct
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import config
@@ -660,6 +661,28 @@ def _start_engine():
                          start_new_session=True, env=env)
     except Exception:
         pass
+
+
+def format_history_line(record) -> str | None:
+    """One `history.jsonl` entry as "HH:MM  text", or None if there is nothing to show.
+
+    The timestamp is already in the file (`{"ts": float, "text": str}`) and used to be
+    thrown away, which left the list unable to answer "when did I say that?".
+
+    Deliberately tolerant: the engine appends to this file on the transcription path,
+    so a torn or malformed line is possible — and one bad line must not blank the
+    whole list. An unusable timestamp degrades to the text alone rather than hiding it.
+    """
+    if not isinstance(record, dict):
+        return None
+    text = record.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    try:
+        return f"{datetime.fromtimestamp(float(record['ts'])):%H:%M}  {text}"
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        return text
 
 
 def apply_settings(cfg: dict) -> bool:
