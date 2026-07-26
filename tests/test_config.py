@@ -60,6 +60,39 @@ def test_save_fills_omitted_keys_instead_of_raising(tmp_path, monkeypatch):
     assert cfg["dock"] == config.DEFAULTS["dock"]
 
 
+def test_dock_alone_does_not_restart_the_engine():
+    """THE defect: ticking "Dock icon" restarted the engine and killed the
+    transcription in flight, for a preference the engine never receives."""
+    old = dict(config.DEFAULTS, dock=True)
+    new = dict(config.DEFAULTS, dock=False)
+    assert config.engine_restart_needed(old, new) is False
+
+
+def test_nothing_changed_does_not_restart_the_engine():
+    assert config.engine_restart_needed(dict(config.DEFAULTS), dict(config.DEFAULTS)) is False
+
+
+def test_every_engine_key_restarts_the_engine():
+    flipped = {"lang": "en", "autosend": False, "autosend_return": False, "vp": False}
+    for key, value in flipped.items():
+        old = dict(config.DEFAULTS)
+        new = dict(config.DEFAULTS, **{key: value})
+        assert config.engine_restart_needed(old, new) is True, f"{key} must force a restart"
+
+
+def test_engine_keys_never_contain_pill_only_preferences():
+    """A guard for the next key: anything the engine does not receive must stay out."""
+    assert "dock" not in config.ENGINE_KEYS
+    assert config.ENGINE_KEYS <= set(config.DEFAULTS), "ENGINE_KEYS must be a subset of the schema"
+
+
+def test_restart_decision_tolerates_missing_keys():
+    """Comparing a pre-existing config (no `vp`) against a fresh one must not raise."""
+    old = {"lang": "it"}                       # legacy file, most keys absent
+    new = dict(config.DEFAULTS)
+    assert config.engine_restart_needed(old, new) is False
+
+
 def test_unknown_keys_dropped_known_kept(tmp_path, monkeypatch):
     _redirect(tmp_path, monkeypatch)
     (tmp_path / "config.json").write_text(json.dumps({"lang": "en", "evil": 1}))

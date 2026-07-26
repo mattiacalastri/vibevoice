@@ -30,6 +30,26 @@ DEFAULTS = {
 }
 
 
+# Keys whose value the engine reads (it receives them as environment variables at
+# spawn time, see vibevoice._start_engine). Changing one of these means the running
+# engine is stale and must be restarted; changing anything else must NOT disturb it.
+# "dock" is deliberately absent: it is a pill-only preference.
+ENGINE_KEYS = frozenset({"lang", "autosend", "autosend_return", "vp"})
+
+
+def engine_restart_needed(old: dict, new: dict) -> bool:
+    """True if a value the engine actually reads changed between `old` and `new`.
+
+    The settings window used to restart the engine on *every* change, so ticking
+    "Dock icon" — a preference the engine never even receives — killed whatever
+    was being transcribed at that moment.
+    """
+    return any(
+        old.get(k, DEFAULTS[k]) != new.get(k, DEFAULTS[k])
+        for k in ENGINE_KEYS
+    )
+
+
 def load() -> dict:
     try:
         raw = json.loads(CONFIG_FILE.read_text())

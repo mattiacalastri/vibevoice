@@ -662,6 +662,27 @@ def _start_engine():
         pass
 
 
+def apply_settings(cfg: dict) -> bool:
+    """Persist `cfg`, apply the Dock policy, and say whether the engine must restart.
+
+    Module-level on purpose. The settings window's callback is an Objective-C
+    selector and cannot be driven from a test, so the part worth testing lives
+    here instead: the window used to restart the engine on *every* change, which
+    meant ticking "Dock icon" — a preference the engine never even receives —
+    killed whatever was being transcribed at that moment.
+
+    Keys the window has no control for (currently `vp`) are carried over from the
+    stored config rather than silently reset to their default.
+    """
+    previous = config.load()
+    merged = {k: cfg.get(k, previous[k]) for k in config.DEFAULTS}
+    config.save(merged)
+    NSApp.setActivationPolicy_(
+        NSApplicationActivationPolicyRegular if merged["dock"]
+        else NSApplicationActivationPolicyAccessory)
+    return config.engine_restart_needed(previous, merged)
+
+
 def _stop_engine():
     try:
         subprocess.Popen(["pkill", "-f", "engine.py"],
@@ -1094,18 +1115,17 @@ class Controller(NSObject):
         self._set_hist.setString_("\n".join(rows) if rows else "(no transcriptions yet)")
 
     def settingsChanged_(self, _sender):
-        cfg = {
+        # Pure wiring: read the controls, hand them to apply_settings, obey the answer.
+        # The decision deliberately does NOT live here — a selector cannot be driven
+        # from a test (PyObjC demands a real Objective-C `self`), and this is precisely
+        # where the "restart the engine for every change" defect hid unnoticed.
+        if apply_settings({
             "lang": str(self._set_lang.titleOfSelectedItem()),
             "autosend": bool(self._set_as.state()),
             "autosend_return": bool(self._set_ar.state()),
             "dock": bool(self._set_dk.state()),
-        }
-        config.save(cfg)
-        NSApp.setActivationPolicy_(
-            NSApplicationActivationPolicyRegular if cfg["dock"]
-            else NSApplicationActivationPolicyAccessory)
-        # engine picks lang/autosend/autosend_return up on next spawn:
-        self.restartEngine_(None)
+        }):
+            self.restartEngine_(None)
 
     def quitAll_(self, sender):
         _stop_engine()
