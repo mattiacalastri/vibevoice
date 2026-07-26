@@ -654,6 +654,7 @@ def _start_engine():
         env.setdefault("VIBEVOICE_LANG", cfg["lang"])
         env.setdefault("VIBEVOICE_AUTOSEND", "1" if cfg["autosend"] else "0")
         env.setdefault("VIBEVOICE_AUTOSEND_RETURN", "1" if cfg["autosend_return"] else "0")
+        env.setdefault("VIBEVOICE_VP", "1" if cfg["vp"] else "0")
         subprocess.Popen([_child_python(), str(ENGINE_PATH)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=env)
