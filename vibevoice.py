@@ -103,7 +103,8 @@ from AppKit import (
     NSTrackingMouseEnteredAndExited, NSTrackingMouseMoved,
     NSTrackingActiveAlways, NSTrackingCursorUpdate,
     NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
-    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable, NSWindowStyleMaskResizable,
+    NSViewWidthSizable, NSViewHeightSizable,
     NSBackingStoreBuffered, NSStatusWindowLevel,
     NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -1064,77 +1065,165 @@ class Controller(NSObject):
                 file=sys.stderr,
             )
 
+    _SET_W = 460            # settings window width
+    _SET_MIN_H = 300        # floor for the resizable height
+    _SET_HISTORY_TICK = 2.0  # history refresh cadence, only while on screen
+
     def openSettings_(self, _sender):
-        cfg = config.load()
         if getattr(self, "_settings_win", None):
             self._settings_win.makeKeyAndOrderFront_(None)
             NSApp.activateIgnoringOtherApps_(True)
+            self._start_history_timer()
             return
-        W, H = 420, 380
+
+        cfg = config.load()
+        W = self._SET_W
+        # Rows are laid out by a cursor walking down from the top instead of the
+        # hand-computed constants this used to carry (H-50, H-85, H-115, ...), where
+        # inserting one row meant recomputing every row below it.
+        rows = [("section", "VOICE"), ("lang", None), ("vp", None),
+                ("section", "BEHAVIOUR"), ("autosend", None), ("autosend_return", None),
+                ("section", "APPEARANCE"), ("dock", None),
+                ("section", "HISTORY")]
+        H = 40 + 26 * sum(1 for k, _ in rows if k != "section") \
+            + 30 * sum(1 for k, _ in rows if k == "section") + 160
+
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H),
-            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
             NSBackingStoreBuffered, False)
         win.setTitle_("VibeVoice — Settings")
+        win.setMinSize_(NSMakeSize(W, self._SET_MIN_H))
         win.center()
         win.setReleasedWhenClosed_(False)
         v = win.contentView()
+        y = [H - 12]                       # a cell, so the closures below can move it
 
-        def _label(text, y):
-            lbl = NSTextField.labelWithString_(text)
-            lbl.setFrame_(NSMakeRect(20, y, 180, 22))
+        def _section(title):
+            y[0] -= 30
+            lbl = NSTextField.labelWithString_(title)
+            lbl.setFrame_(NSMakeRect(20, y[0], W - 40, 18))
+            lbl.setFont_(NSFont.boldSystemFontOfSize_(10))
+            lbl.setTextColor_(NSColor.secondaryLabelColor())
             v.addSubview_(lbl)
-            return lbl
 
-        def _check(title, y, on, action):
-            b = NSButton.buttonWithTitle_target_action_(title, self, action)
-            b.setButtonType_(3)  # NSButtonTypeSwitch (checkbox)
-            b.setFrame_(NSMakeRect(200, y, 200, 22))
+        def _row(label):
+            y[0] -= 26
+            lbl = NSTextField.labelWithString_(label)
+            lbl.setFrame_(NSMakeRect(20, y[0], 160, 20))
+            v.addSubview_(lbl)
+            return y[0]
+
+        def _check(label, caption, on):
+            top = _row(label)
+            b = NSButton.buttonWithTitle_target_action_(caption, self, "settingsChanged:")
+            b.setButtonType_(3)            # NSButtonTypeSwitch (checkbox)
+            b.setFrame_(NSMakeRect(190, top, W - 210, 20))
             b.setState_(1 if on else 0)
             v.addSubview_(b)
             return b
 
-        _label("Language", H - 50)
+        _section("VOICE")
+        top = _row("Language")
         self._set_lang = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(200, H - 54, 120, 26), False)
+            NSMakeRect(188, top - 3, 120, 26), False)
         self._set_lang.addItemsWithTitles_(["it", "en"])
         self._set_lang.selectItemWithTitle_(cfg["lang"])
         self._set_lang.setTarget_(self)
         self._set_lang.setAction_("settingsChanged:")
         v.addSubview_(self._set_lang)
+        # The engine has always read VIBEVOICE_VP; until now nothing could set it.
+        self._set_vp = _check("Voice processing", "echo + noise cancellation", cfg["vp"])
 
-        _label("Autosend (paste)", H - 85)
-        self._set_as = _check("enabled", H - 85, cfg["autosend"], "settingsChanged:")
-        _label("Auto-Return", H - 115)
-        self._set_ar = _check("press Return", H - 115, cfg["autosend_return"], "settingsChanged:")
-        _label("Dock icon", H - 145)
-        self._set_dk = _check("show in Dock", H - 145, cfg["dock"], "settingsChanged:")
+        _section("BEHAVIOUR")
+        self._set_as = _check("Auto-paste", "paste the transcription", cfg["autosend"])
+        self._set_ar = _check("Auto-Return", "press Return after pasting",
+                              cfg["autosend_return"])
 
-        _label("History", H - 180)
-        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, 150))
+        _section("APPEARANCE")
+        self._set_dk = _check("Dock icon", "show in Dock", cfg["dock"])
+
+        _section("HISTORY")
+        clear = NSButton.buttonWithTitle_target_action_("Clear", self, "clearHistory:")
+        clear.setFrame_(NSMakeRect(W - 90, y[0] - 2, 70, 22))
+        clear.setAutoresizingMask_(1)      # NSViewMinXMargin: stay glued to the right
+        v.addSubview_(clear)
+
+        y[0] -= 8
+        hist_h = max(110, y[0] - 20)
+        sc = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(20, y[0] - hist_h, W - 40, hist_h))
+        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, hist_h))
         tv.setEditable_(False)
-        sc = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 20, W - 40, 150))
         sc.setDocumentView_(tv)
         sc.setHasVerticalScroller_(True)
+        # The history is the only thing worth growing when the window is resized.
+        sc.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         v.addSubview_(sc)
+
         self._set_hist = tv
-        self._reload_history()
         self._settings_win = win
+        self._reload_history()
         win.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
+        self._start_history_timer()
+
+    # ── history pane ──────────────────────────────────────────────────────────
+
+    def _start_history_timer(self):
+        """Refresh the list while the window is up. Dictating with Settings open used
+        to leave a list frozen at whatever it said when the window was created."""
+        if getattr(self, "_hist_timer", None) is not None:
+            return
+        self._hist_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            self._SET_HISTORY_TICK, self, "historyTick:", None, True)
+
+    def _stop_history_timer(self):
+        timer = getattr(self, "_hist_timer", None)
+        if timer is not None:
+            timer.invalidate()
+            self._hist_timer = None
+
+    def historyTick_(self, _timer):
+        # Self-invalidating instead of relying on a window delegate: a closed
+        # Settings window must not cost a wakeup every two seconds forever.
+        win = getattr(self, "_settings_win", None)
+        if win is None or not win.isVisible():
+            self._stop_history_timer()
+            return
+        self._reload_history()
+
+    def clearHistory_(self, _sender):
+        """Truncate history.jsonl. Allowed: invariant #1 names `state`, `levels.bin`
+        and `raw.txt` — not this file. The engine appends, so the next utterance
+        simply starts a fresh list."""
+        try:
+            (STATE_DIR / "history.jsonl").write_text("")
+        except OSError:
+            pass
+        self._reload_history()
 
     def _reload_history(self):
         import json
+
         rows = []
         try:
             lines = (STATE_DIR / "history.jsonl").read_text().splitlines()
-            for ln in reversed(lines):
-                if not ln.strip():
-                    continue
-                d = json.loads(ln)
-                rows.append("• %s" % d.get("text", ""))
-        except (OSError, ValueError):
-            rows = []
+        except OSError:
+            lines = []
+        for ln in reversed(lines):
+            if not ln.strip():
+                continue
+            # Per line, not around the loop: the previous form wrapped the whole
+            # read in one try/except and blanked `rows`, so a single torn line
+            # erased every good line above it too.
+            try:
+                record = json.loads(ln)
+            except ValueError:
+                continue
+            shown = format_history_line(record)
+            if shown:
+                rows.append(shown)
         self._set_hist.setString_("\n".join(rows) if rows else "(no transcriptions yet)")
 
     def settingsChanged_(self, _sender):
@@ -1147,6 +1236,7 @@ class Controller(NSObject):
             "autosend": bool(self._set_as.state()),
             "autosend_return": bool(self._set_ar.state()),
             "dock": bool(self._set_dk.state()),
+            "vp": bool(self._set_vp.state()),
         }):
             self.restartEngine_(None)
 

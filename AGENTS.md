@@ -227,6 +227,10 @@ still verified behaviorally. After any change, also exercise the path you touche
 
 - **UI / pill changes** → `python3 vibevoice.py --demo` and watch the waveform, the
   fade in/out, the typewriter text, the ✕/⧉ hit-targets. No mic needed.
+- **Settings window changes** → `python3 tools/smoke_settings_window.py`. It builds the
+  real window against a throwaway `HOME`, drives the controls and closes it — the AppKit
+  calls in `openSettings_` only fail at runtime, so `pytest` passing proves nothing about
+  them. It is not a pytest because creating a window needs a GUI session and CI is headless.
 - **Engine / VAD / transcription** → run `python3 engine.py`, speak a short phrase and a
   long monologue; confirm `~/.vibevoice/state` cycles `idle→recording→transcribing→idle`,
   `raw.txt` updates, and the long monologue is not truncated (invariant #4/#5).
