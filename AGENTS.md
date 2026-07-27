@@ -82,6 +82,9 @@ own `autosend` flag.
 | `~/.vibevoice/corrections.jsonl` | user corrections `{ts,raw,corrected}`, JSONL capped — few-shot examples for the cleanup prompt; new terms flow into `dictionary.txt` | `tools/vibevoice_correct.py` | engine (`_load_corrections()`) |
 | `~/.vibevoice/locked` | presence = pill stays visible (no auto-hide) | pill | pill |
 | `~/.vibevoice/robot_pos` | text: `x,y` — saved position of the floating robot widget (drag) | pill | pill |
+| `~/.vibevoice/widget` | presence = hardware-look floating voice widget shown (menu toggle 🎛; independent of `SHOW_PILL`) | pill | pill |
+| `~/.vibevoice/widget_pos` | text: `x,y` — saved position of the hardware widget (drag) | pill | pill |
+| `~/.vibevoice/cleanup_key` | bearer key for the cleanup endpoint (chmod 600) — fallback when the env vars are absent (LaunchAgent plists can't read the shell env) | user | engine (`cleanup_text()`) |
 | `~/.vibevoice/tts` | presence = TTS-reactivity hook enabled (optional) | external TTS | pill |
 | `~/.vibevoice/tts.txt` | line 1 `<start_epoch> <duration_s>`, line 2+ spoken text — the pill types it out in sync, tinted red (optional) | external TTS | pill |
 | `~/.vibevoice/tts_levels.bin` | **exactly 60 × float32 little-endian** RMS of the TTS audio (optional) | external TTS | pill |

@@ -66,6 +66,8 @@ When tts.txt is present and fresh, the pill turns RED and types out the spoken
 sentence in sync with the audio (a mirror of the green dictation waveform).
 
   ~/.vibevoice/robot_pos   "x,y" — saved position of the floating robot (drag)
+  ~/.vibevoice/widget      presence = hardware-look voice widget shown (menu toggle)
+  ~/.vibevoice/widget_pos  "x,y" — saved position of the hardware widget (drag)
 
 Menu / robot acts as the master switch:
   - toggle the engine (launches/kills engine.py via subprocess)
@@ -129,6 +131,8 @@ TTS_FLAG   = STATE_DIR / "tts"            # presence = feature enabled
 TTS_TEXT   = STATE_DIR / "tts.txt"        # line1 "<start> <dur>", line2+ spoken text
 TTS_LEVELS = STATE_DIR / "tts_levels.bin" # 60 float32 LE (RMS of the TTS audio)
 ROBOT_POS  = STATE_DIR / "robot_pos"      # "x,y" saved position of the floating robot
+WIDGET_FLAG = STATE_DIR / "widget"        # presence = hardware-look widget shown (pill writes via menu)
+WIDGET_POS  = STATE_DIR / "widget_pos"    # "x,y" saved position of the hardware widget (drag)
 
 # engine.py / autosend.py live next to this file
 ENGINE_PATH   = Path(os.path.abspath(__file__)).parent / "engine.py"
@@ -147,6 +151,44 @@ def _flag_on(path) -> bool:
         return path.exists()
     except Exception:
         return False
+
+
+# ── hardware widget: pure logic (locked by tests/test_widget_logic.py) ────────
+WIDGET_BARS = 24        # VU columns on the widget's recessed display
+
+
+def widget_bar_levels(levels, n=WIDGET_BARS) -> list:
+    """Downsample the RMS history to n VU bars, peak per bucket, clamped 0..1.
+
+    Peak (not mean): a single spike must survive downsampling or the meter
+    reads dead during short plosives — VU behavior, not smoothing.
+    """
+    if not levels:
+        return [0.0] * n
+    total = len(levels)
+    bars = []
+    for i in range(n):
+        a = int(i * total / n)
+        b = max(a + 1, int((i + 1) * total / n))
+        bars.append(max(0.0, min(1.0, max(levels[a:b]))))
+    return bars
+
+
+def widget_led(state: str, muted: bool, engine_on: bool) -> tuple:
+    """(r, g, b) tint of the widget's status LED.
+
+    Priority mirrors what the hardware would do: power off → grey, muted →
+    amber (a warning, whatever the engine thinks), REC → red, listening → green.
+    """
+    if not engine_on:
+        return (0.42, 0.42, 0.42)
+    if muted:
+        return (1.0, 0.62, 0.08)
+    if state == "recording":
+        return (1.0, 0.16, 0.14)
+    if state == "transcribing":
+        return (1.0, 0.78, 0.12)
+    return (0.12, 0.95, 0.35)
 
 
 def _toggle_flag(path) -> bool:
@@ -607,6 +649,165 @@ class RobotView(NSView):
         self._drag0 = None
 
 
+WIDGET_W, WIDGET_H = 172.0, 50.0
+
+
+class HardwareView(NSView):
+    """Hardware-look floating voice widget (Wispr-style): an anodized-aluminum
+    capsule with corner screws, a status LED and a recessed VU display — pure
+    UI pretending to be a device. Click = control center (same menu as the
+    status item) · drag = reposition (persisted in WIDGET_POS)."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(HardwareView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.levels = []          # RMS history (the engine's levels.bin, via tick)
+        self.state = ""           # idle | recording | transcribing ("" = engine off)
+        self.muted = False
+        self.engine_on = False
+        self.phase = 0.0          # animation clock (LED pulse)
+        self.owner = None         # Controller (for the popup menu)
+        self._drag0 = None
+        self._moved = False
+        return self
+
+    def drawRect_(self, rect):
+        import math as _math
+        from AppKit import NSGradient
+        b = self.bounds()
+        W, H = b.size.width, b.size.height
+
+        # ── body: anodized capsule, light from the top ────────────────────────
+        body_r = NSMakeRect(3.0, 3.0, W - 6.0, H - 6.0)
+        body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(body_r, 10.0, 10.0)
+        g = NSGradient.alloc().initWithStartingColor_endingColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.31, 0.33, 0.37, 0.98),
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.12, 0.13, 0.16, 0.98))
+        g.drawInBezierPath_angle_(body, -90.0)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.55).set()
+        body.setLineWidth_(1.0)
+        body.stroke()
+        # machined edge: inner top highlight + inner bottom shade
+        hi = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(4.2, 4.2, W - 8.4, H - 8.4), 8.8, 8.8)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.14).set()
+        hi.setLineWidth_(0.8)
+        hi.stroke()
+
+        # ── corner screws (the tell that it "is" hardware) ────────────────────
+        for sx, sy, ang in ((10.0, 10.0, 0.6), (W - 10.0, 10.0, 2.2),
+                            (10.0, H - 10.0, 1.5), (W - 10.0, H - 10.0, 0.2)):
+            sr = 2.2
+            screw = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(sx - sr, sy - sr, sr * 2, sr * 2))
+            sg = NSGradient.alloc().initWithStartingColor_endingColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.57, 0.60, 1.0),
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.20, 0.21, 0.24, 1.0))
+            sg.drawInBezierPath_angle_(screw, -90.0)
+            # slot, each screw at its own angle (real assembly, not a texture)
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.06, 0.06, 0.08, 0.9).set()
+            slot = NSBezierPath.bezierPath()
+            dx, dy = sr * 0.85 * _math.cos(ang), sr * 0.85 * _math.sin(ang)
+            slot.moveToPoint_(NSMakePoint(sx - dx, sy - dy))
+            slot.lineToPoint_(NSMakePoint(sx + dx, sy + dy))
+            slot.setLineWidth_(0.8)
+            slot.stroke()
+
+        # ── status LED (left), glow + pulse while recording ───────────────────
+        tc = widget_led(self.state, self.muted, self.engine_on)
+        cx, cy, lr = 21.0, H / 2.0 + 4.0, 3.6
+        pulse = 1.0
+        if self.state == "recording":
+            pulse = 0.70 + 0.30 * _math.sin(self.phase * 6.0)
+        for gr, ga in ((3.2, 0.10), (1.8, 0.18)):
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(tc[0], tc[1], tc[2], ga * pulse).set()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(cx - lr - gr, cy - lr - gr, (lr + gr) * 2, (lr + gr) * 2)).fill()
+        # bezel (the LED sits IN the metal)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.04, 0.04, 0.06, 1.0).set()
+        NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(cx - lr - 1.2, cy - lr - 1.2, (lr + 1.2) * 2, (lr + 1.2) * 2)).fill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            tc[0] * pulse, tc[1] * pulse, tc[2] * pulse, 1.0).set()
+        NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(cx - lr, cy - lr, lr * 2, lr * 2)).fill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.35 * pulse).set()
+        NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(cx - lr * 0.45, cy + lr * 0.05, lr * 0.8, lr * 0.8)).fill()
+
+        # ── recessed VU display ───────────────────────────────────────────────
+        dx0, dy0 = 36.0, 11.0
+        dw, dh = W - dx0 - 13.0, H - 22.0
+        disp_r = NSMakeRect(dx0, dy0, dw, dh)
+        disp = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(disp_r, 5.0, 5.0)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.015, 0.02, 0.03, 1.0).set()
+        disp.fill()
+        # recess: dark rim + faint reflected light on the lower lip
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, 0.8).set()
+        disp.setLineWidth_(1.2)
+        disp.stroke()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.10).set()
+        lip = NSBezierPath.bezierPath()
+        lip.moveToPoint_(NSMakePoint(dx0 + 5.0, dy0 - 0.8))
+        lip.lineToPoint_(NSMakePoint(dx0 + dw - 5.0, dy0 - 0.8))
+        lip.setLineWidth_(0.8)
+        lip.stroke()
+        # VU bars (green, red-tipped when hot; dim baseline when the engine is off)
+        bars = widget_bar_levels(self.levels if self.engine_on else [])
+        gap, pad = 2.0, 5.0
+        bw = (dw - 2 * pad - gap * (WIDGET_BARS - 1)) / WIDGET_BARS
+        for i, lvl in enumerate(bars):
+            x = dx0 + pad + i * (bw + gap)
+            bh = max(1.6, lvl * (dh - 8.0))
+            y = dy0 + (dh - bh) / 2.0
+            if not self.engine_on:
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.20, 0.30, 0.24, 0.8).set()
+            elif lvl > 0.85:
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.25, 0.18, 0.95).set()
+            else:
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                    0.10 + 0.5 * lvl, 0.92, 0.30, 0.95).set()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(x, y, bw, bh), 1.0, 1.0).fill()
+
+        # ── engraved serial (the wink) ────────────────────────────────────────
+        label = NSString.stringWithString_("VV·01")
+        label.drawAtPoint_withAttributes_(
+            NSMakePoint(12.0, 5.0),
+            {NSFontAttributeName: NSFont.systemFontOfSize_(5.0),
+             NSForegroundColorAttributeName:
+                 NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.28)})
+
+    # ── drag anywhere (persisted) · plain click = control center ─────────────
+    def mouseDown_(self, event):
+        w = self.window()
+        self._drag0 = (NSEvent.mouseLocation(), w.frame().origin)
+        self._moved = False
+
+    def mouseDragged_(self, event):
+        if not self._drag0:
+            return
+        m0, o0 = self._drag0
+        m1 = NSEvent.mouseLocation()
+        dx, dy = m1.x - m0.x, m1.y - m0.y
+        if abs(dx) + abs(dy) > 3:
+            self._moved = True
+        self.window().setFrameOrigin_(NSMakePoint(o0.x + dx, o0.y + dy))
+
+    def mouseUp_(self, event):
+        if self._moved:
+            try:
+                o = self.window().frame().origin
+                WIDGET_POS.write_text(f"{o.x},{o.y}")
+            except Exception:
+                pass
+        else:
+            if self.owner is not None and getattr(self.owner, "mb_menu", None):
+                NSMenu.popUpContextMenu_withEvent_forView_(self.owner.mb_menu, event, self)
+        self._drag0 = None
+
+
 def _child_python():
     """Interpreter for spawning the engine.py/autosend.py siblings.
 
@@ -771,6 +972,12 @@ class Controller(NSObject):
         self._build_menubar()
         if SHOW_PILL:
             self._build_robot()
+        # Hardware-look widget: independent of SHOW_PILL (its own control flag),
+        # so it can be the sole floating surface in menu-bar-only mode.
+        self.widget_panel = None
+        self.widget_view = None
+        if _flag_on(WIDGET_FLAG):
+            self._build_widget()
         # Optional: come up already dictating when launchd-managed. Gated by env so
         # the default (manual toggle) is unchanged. The engine is spawned here in
         # the pill's GUI/TCC context, where the mic permission resolves correctly.
@@ -823,6 +1030,50 @@ class Controller(NSObject):
         rp.orderFrontRegardless()
         self.robot_panel = rp
         self.robot_view = rv
+
+    def _build_widget(self):
+        """Hardware-look floating voice widget (HardwareView). Same panel recipe
+        as the robot; default berth bottom-center, Wispr-style."""
+        scr = NSScreen.mainScreen()
+        sf = scr.frame()
+        x = sf.origin.x + (sf.size.width - WIDGET_W) / 2.0
+        y = sf.origin.y + 84.0
+        try:
+            sx, sy = WIDGET_POS.read_text().strip().split(",")
+            x, y = float(sx), float(sy)
+        except Exception:
+            pass
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        wp = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(x, y, WIDGET_W, WIDGET_H), style, NSBackingStoreBuffered, False)
+        wp.setOpaque_(False)
+        wp.setBackgroundColor_(NSColor.clearColor())
+        wp.setLevel_(NSStatusWindowLevel)
+        wp.setHasShadow_(True)   # a real drop shadow sells the "device on the desk"
+        wp.setIgnoresMouseEvents_(False)
+        wp.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorStationary)
+        wv = HardwareView.alloc().initWithFrame_(NSMakeRect(0, 0, WIDGET_W, WIDGET_H))
+        wv.owner = self
+        wv.engine_on = self._mic_is_on()
+        wp.setContentView_(wv)
+        wp.setAlphaValue_(1.0)
+        wp.orderFrontRegardless()
+        self.widget_panel = wp
+        self.widget_view = wv
+
+    def toggleWidget_(self, sender):
+        # 🎛 hardware widget on/off — persisted via its control flag so the
+        # choice survives pill restarts.
+        _toggle_flag(WIDGET_FLAG)
+        if _flag_on(WIDGET_FLAG):
+            if getattr(self, "widget_panel", None) is None:
+                self._build_widget()
+            else:
+                self.widget_panel.orderFrontRegardless()
+        elif getattr(self, "widget_panel", None) is not None:
+            self.widget_panel.orderOut_(None)
 
     def _build_window(self):
         # find the screen with the NOTCH (built-in), NOT mainScreen
@@ -973,6 +1224,9 @@ class Controller(NSObject):
         self.mb_loop = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("🔁 Auto-send loop", "toggleLoop:", "")
         self.mb_loop.setTarget_(self)
         menu.addItem_(self.mb_loop)
+        self.mb_widget = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("🎛 Hardware widget", "toggleWidget:", "")
+        self.mb_widget.setTarget_(self)
+        menu.addItem_(self.mb_widget)
         st = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("⚙️ Settings…", "openSettings:", ",")
         st.setTarget_(self)
         menu.addItem_(st)
@@ -1454,6 +1708,19 @@ class Controller(NSObject):
         except Exception:
             pass
         self.view.setLevels_text_active_(levels, text, active)
+        # hardware widget: mirror the same tick data (its own redraw, cheap)
+        if getattr(self, "widget_view", None) is not None and _flag_on(WIDGET_FLAG):
+            try:
+                wv = self.widget_view
+                wv.levels = list(levels)
+                wv.engine_on = engine_on or self.demo or self.place
+                wv.muted = self.view.muted
+                wv.state = ("recording" if (self.demo or self.place)
+                            else (self._read_state() if engine_on else ""))
+                wv.phase = self.view.phase
+                wv.setNeedsDisplay_(True)
+            except Exception:
+                pass
         # SELF-HEAL the status item: on recent macOS an item created before
         # launch-finish can be parked off-screen (y<0, screen=None). Detect it →
         # destroy and recreate the item at runtime (max 3 attempts, every ~3s).
