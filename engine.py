@@ -39,11 +39,17 @@
 #                            written atomically (tmp + os.replace)
 #   ~/.vibevoice/raw.txt     last transcription, plain text (sentence only)
 #   ~/.vibevoice/history.jsonl  last 20 transcriptions, JSONL {"ts","text"}, newest last
+#   ~/.vibevoice/metrics.jsonl  per-utterance latency telemetry, JSONL, capped
+#                            (report: tools/vibevoice_metrics.py)
 #
 # CONTROL FILES (written by the pill / external tools, read by the engine — the
 # same external-control pattern as autosend's pause flag, NOT engine-owned state):
 #   ~/.vibevoice/muted       presence = mic paused: the engine stays alive but
 #                            ignores the microphone (no recording/transcription)
+#   ~/.vibevoice/dictionary.txt   personal terms, one per line — biases Whisper
+#                            via initial_prompt and the cleanup glossary
+#   ~/.vibevoice/corrections.jsonl  user corrections {ts,raw,corrected} — few-shot
+#                            examples for the cleanup prompt (tools/vibevoice_correct.py)
 #
 # Environment variables:
 #   VIBEVOICE_LANG            transcription language code (default: "it")
@@ -58,6 +64,13 @@
 #                             copy shipped with the `silero_vad` package. With
 #                             neither the model nor onnxruntime available the
 #                             speech decision falls back to the RMS threshold.
+#   VIBEVOICE_CLEANUP         "1" enables the LLM cleanup pass after
+#                             transcription (default: "0"; any failure falls
+#                             back to the raw text)
+#   VIBEVOICE_CLEANUP_URL     OpenAI-compatible endpoint (default: Groq)
+#   VIBEVOICE_CLEANUP_MODEL   model id for the cleanup pass
+#   VIBEVOICE_CLEANUP_TIMEOUT seconds before the cleanup call is abandoned
+#   VIBEVOICE_CLEANUP_API_KEY bearer key (falls back to GROQ_API_KEY)
 # ---------------------------------------------------------------------------
 
 import os
