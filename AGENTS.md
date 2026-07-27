@@ -77,6 +77,7 @@ own `autosend` flag.
 | `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py, pill | autosend.py, pill |
 | `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock) | external tools | autosend.py |
 | `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
+| `~/.vibevoice/dictionary.txt` | personal terms, one per line, `#` comments — biases Whisper via `initial_prompt` (max `DICT_MAX_TERMS`) | user, external tools | engine (`load_dictionary()`) |
 | `~/.vibevoice/locked` | presence = pill stays visible (no auto-hide) | pill | pill |
 | `~/.vibevoice/robot_pos` | text: `x,y` — saved position of the floating robot widget (drag) | pill | pill |
 | `~/.vibevoice/tts` | presence = TTS-reactivity hook enabled (optional) | external TTS | pill |

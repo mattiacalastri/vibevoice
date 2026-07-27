@@ -94,6 +94,7 @@ LEVELS_TMP = STATE_DIR / "levels.tmp"   # staging for atomic replace
 RAW_FILE = STATE_DIR / "raw.txt"        # last transcription, plain text
 HISTORY_FILE = STATE_DIR / "history.jsonl"  # last 20 transcriptions, JSONL {"ts","text"}
 MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
+DICT_FILE = STATE_DIR / "dictionary.txt"  # control file: personal terms, one per line (user/tools write, engine reads)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -111,6 +112,8 @@ LEVELS_LEN = 60         # number of float32 RMS samples in levels.bin
 LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
 
 HISTORY_MAX = 20        # max lines in history.jsonl
+
+DICT_MAX_TERMS = 64     # terms fed to Whisper's initial_prompt (its context window is ~224 tokens)
 
 VAD_THRESHOLD = 0.015   # RMS above this starts/sustains "recording"
 SILERO_ONSET = 0.5      # speech probability that turns the decision ON (hysteresis high)
@@ -178,6 +181,24 @@ def _append_history(text: str) -> None:
         pass
 
 
+def load_dictionary() -> list:
+    """Read the personal dictionary (one term per line, `#` starts a comment).
+
+    Missing or unreadable file → empty list: the dictionary is a bias, never a
+    dependency. Capped at DICT_MAX_TERMS so the joined prompt stays within
+    Whisper's initial_prompt context budget.
+    """
+    try:
+        terms = []
+        for line in DICT_FILE.read_text().splitlines():
+            term = line.strip()
+            if term and not term.startswith("#"):
+                terms.append(term)
+        return terms[:DICT_MAX_TERMS]
+    except Exception:
+        return []
+
+
 def is_muted() -> bool:
     """Return True while the mute control file is present.
 
@@ -240,11 +261,16 @@ def transcribe(audio: np.ndarray) -> str:
     wav_path = None
     try:
         wav_path = save_wav(audio)
-        result = _MLX_WHISPER.transcribe(
-            wav_path,
-            path_or_hf_repo=MODEL,
-            language=LANG,
-        )
+        kwargs: dict = {"path_or_hf_repo": MODEL, "language": LANG}
+        try:
+            terms = load_dictionary()
+        except Exception:
+            terms = []
+        if terms:
+            # initial_prompt biases decoding toward these spellings — it is the
+            # cheap half of Wispr-style context conditioning (names, jargon).
+            kwargs["initial_prompt"] = "Glossario: " + ", ".join(terms) + "."
+        result = _MLX_WHISPER.transcribe(wav_path, **kwargs)
         text = (result.get("text") or "").strip()
         return text
     except Exception as err:
