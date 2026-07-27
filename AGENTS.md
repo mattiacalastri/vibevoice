@@ -375,12 +375,14 @@ in §3 — and update this section if you do.
    transcription and pastes it; the user's previous clipboard is lost. Restoring
    it is possible but races with fast successive dictations — left simple on
    purpose. Don't add a naive save/restore without handling overlap.
-3. **Two transcriptions may finish out of order.** `Semaphore(2)` (invariant #4)
-   keeps the tail of a long monologue from being dropped, but if two blobs are in
-   flight the second can complete first, pasting text slightly out of order. This
-   is an accepted trade vs. dropping audio. Do **not** revert to `Semaphore(1)` to
-   "fix ordering" — that reintroduces the dropped-monologue bug (commit `9e6ee0e`).
-   A correct fix would sequence *paste* order while keeping concurrent transcribe.
+3. **Two transcriptions may finish out of order — pastes may NOT.** `Semaphore(2)`
+   (invariant #4) keeps the tail of a long monologue from being dropped; since
+   sess.9685 the paste step is sequenced (`_paste_in_order`: each finalized
+   utterance takes a sequence number, the paste waits its turn, bounded by
+   `_PASTE_ORDER_TIMEOUT` so a wedged predecessor can't dam the queue — a late
+   paste beats a lost one). Transcription stays concurrent. Do **not** revert to
+   `Semaphore(1)` — that reintroduces the dropped-monologue bug (commit `9e6ee0e`);
+   an empty transcription must still advance the sequence (locked by tests).
 4. **Exceptions are swallowed widely** (`except Exception: pass` / writes to
    `stderr`). This is required for the realtime audio callback (#3) and keeps the
    daemons crash-proof, but it hides systematic failures. When debugging, add

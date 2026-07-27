@@ -23,6 +23,9 @@ def quality_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "RAW_FILE", tmp_path / "raw.txt")
     monkeypatch.setattr(engine, "HISTORY_FILE", tmp_path / "history.jsonl")
     monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
+    monkeypatch.setattr(engine, "STATE_FILE", tmp_path / "state")
+    monkeypatch.setattr(engine, "LEVELS_FILE", tmp_path / "levels.bin")
+    monkeypatch.setattr(engine, "LEVELS_TMP", tmp_path / "levels.tmp")
     return tmp_path
 
 
@@ -153,6 +156,77 @@ def test_process_utterance_empty_transcription_writes_nothing(quality_state, mon
     assert engine.process_utterance(audio, t_end=None) == ""
     assert not engine.RAW_FILE.exists()
     assert not engine.METRICS_FILE.exists()
+
+
+# ── paste ordering (long-dictation quality) ──────────────────────────────────
+
+def test_pastes_stay_in_utterance_order_even_when_second_finishes_first(
+    quality_state, monkeypatch
+):
+    """Two blobs in flight (Semaphore(2), invariant #4): the SECOND may finish
+    transcribing first, but pastes must land in speech order — out-of-order
+    pastes scramble long dictations (AGENTS.md §9.3, the documented sharp edge:
+    the correct fix sequences PASTE order while keeping concurrent transcribe)."""
+    import threading
+    import time as _t
+
+    eng = engine.Engine()
+    pasted = []
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "autosend", lambda text: pasted.append(text))
+
+    def fake_process(audio, t_end=None):
+        _t.sleep(0.30 if len(audio) > 100 else 0.02)  # first slow, second fast
+        return "prima frase" if len(audio) > 100 else "seconda frase"
+
+    monkeypatch.setattr(engine, "process_utterance", fake_process)
+
+    slow = np.zeros(1000, dtype=np.float32)
+    fast = np.zeros(10, dtype=np.float32)
+    eng._busy.acquire(blocking=False)
+    eng._busy.acquire(blocking=False)  # both slots taken, as _finalize does
+    t1 = threading.Thread(target=eng._transcribe_worker, args=(slow, 0.0, 0), daemon=True)
+    t2 = threading.Thread(target=eng._transcribe_worker, args=(fast, 0.0, 1), daemon=True)
+    t1.start()
+    _t.sleep(0.05)
+    t2.start()
+
+    deadline = _t.monotonic() + 3.0
+    while len(pasted) < 2 and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    assert pasted == ["prima frase", "seconda frase"]
+
+
+def test_empty_transcription_does_not_dam_the_paste_queue(quality_state, monkeypatch):
+    """An utterance that transcribes to '' must still advance the sequence, or
+    every following paste waits for a turn that never comes."""
+    import threading
+    import time as _t
+
+    eng = engine.Engine()
+    pasted = []
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "autosend", lambda text: pasted.append(text))
+    monkeypatch.setattr(
+        engine, "process_utterance",
+        lambda audio, t_end=None: "" if len(audio) > 100 else "dopo il vuoto",
+    )
+
+    eng._busy.acquire(blocking=False)
+    eng._busy.acquire(blocking=False)
+    t1 = threading.Thread(
+        target=eng._transcribe_worker,
+        args=(np.zeros(1000, dtype=np.float32), 0.0, 0), daemon=True)
+    t2 = threading.Thread(
+        target=eng._transcribe_worker,
+        args=(np.zeros(10, dtype=np.float32), 0.0, 1), daemon=True)
+    t1.start()
+    t2.start()
+
+    deadline = _t.monotonic() + 3.0
+    while len(pasted) < 1 and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    assert pasted == ["dopo il vuoto"]
 
 
 # ── LLM cleanup pass (env-gated; degradation is contract) ────────────────────

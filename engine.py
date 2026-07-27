@@ -1014,6 +1014,13 @@ class Engine:
         self._stop = threading.Event()
         self._busy = threading.Semaphore(2)  # up to two transcriptions in flight — keeps the tail of a long utterance from being dropped while the previous blob is still transcribing
 
+        # Paste sequencing (long-dictation quality): transcriptions may finish
+        # out of order, pastes must not. Each finalized utterance takes a
+        # sequence number; the paste step waits (bounded) for its turn.
+        self._paste_cv = threading.Condition()
+        self._seq_next = 0    # next sequence number to assign at finalize
+        self._paste_next = 0  # next sequence allowed to paste
+
         # Speech decider (F2). Constructed unstarted: until run() calls
         # start(), is_speech() is exactly the legacy RMS-threshold decision.
         self._vad = SileroVad()
@@ -1181,26 +1188,56 @@ class Engine:
 
         # Up to two transcriptions in flight; if both slots are busy, drop this utterance.
         if self._busy.acquire(blocking=False):
+            with self._paste_cv:
+                seq = self._seq_next
+                self._seq_next += 1
             threading.Thread(
-                target=self._transcribe_worker, args=(audio, now), daemon=True
+                target=self._transcribe_worker, args=(audio, now, seq), daemon=True
             ).start()
         else:
             write_state("idle")
 
-    def _transcribe_worker(self, audio: np.ndarray, t_end: float = 0.0) -> None:
-        """Transcribe, publish to raw.txt, and optionally autosend."""
+    _PASTE_ORDER_TIMEOUT = 8.0  # a wedged predecessor must not dam the queue forever
+
+    def _transcribe_worker(self, audio: np.ndarray, t_end: float = 0.0,
+                           seq: int | None = None) -> None:
+        """Transcribe, publish to raw.txt, and optionally autosend (in order)."""
         try:
             write_state("transcribing")
             text = process_utterance(audio, t_end=t_end or None)
             if text and AUTOSEND:
-                # Paste off the worker thread so we return to idle promptly.
+                # Paste off the worker thread (the busy slot frees promptly);
+                # the paste thread itself enforces utterance order.
                 threading.Thread(
-                    target=autosend, args=(text,), daemon=True
+                    target=self._paste_in_order, args=(seq, text), daemon=True
                 ).start()
+            else:
+                # No paste for this utterance — its turn must pass anyway.
+                self._advance_paste(seq)
         finally:
             write_state("idle")
             write_levels(self._rms_history)
             self._busy.release()
+
+    def _paste_in_order(self, seq, text: str) -> None:
+        """Paste when it is this utterance's turn (bounded wait, then paste
+        anyway: a late paste beats a lost one)."""
+        if seq is not None:
+            deadline = time.monotonic() + self._PASTE_ORDER_TIMEOUT
+            with self._paste_cv:
+                while self._paste_next < seq and time.monotonic() < deadline:
+                    self._paste_cv.wait(timeout=0.25)
+        try:
+            autosend(text)
+        finally:
+            self._advance_paste(seq)
+
+    def _advance_paste(self, seq) -> None:
+        if seq is None:
+            return
+        with self._paste_cv:
+            self._paste_next = max(self._paste_next, seq + 1)
+            self._paste_cv.notify_all()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
