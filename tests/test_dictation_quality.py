@@ -201,6 +201,38 @@ def test_cleanup_success_returns_polished_text(quality_state, cleanup_enabled, m
     assert "ehm ciao a tutti" in json.dumps(seen["payload"])
 
 
+def test_cleanup_key_falls_back_to_key_file(quality_state, monkeypatch):
+    import urllib.request
+
+    monkeypatch.setattr(engine, "CLEANUP_ENABLED", True)
+    monkeypatch.setattr(engine, "CLEANUP_API_KEY", "")  # no env key
+    monkeypatch.setattr(engine, "CLEANUP_KEY_FILE", engine.DICT_FILE.parent / "cleanup_key")
+    engine.CLEANUP_KEY_FILE.write_text("file-key\n")
+    seen = {}
+
+    def _fake_urlopen(req, timeout=None):
+        seen["auth"] = req.get_header("Authorization")
+        return _FakeHTTPResponse(_chat_response("Pulito."))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    assert engine.cleanup_text("grezzo qui") == "Pulito."
+    assert seen["auth"] == "Bearer file-key"
+
+
+def test_cleanup_without_any_key_skips_silently(quality_state, monkeypatch):
+    import urllib.request
+
+    monkeypatch.setattr(engine, "CLEANUP_ENABLED", True)
+    monkeypatch.setattr(engine, "CLEANUP_API_KEY", "")
+    monkeypatch.setattr(engine, "CLEANUP_KEY_FILE", engine.DICT_FILE.parent / "missing_key")
+
+    def _boom(*a, **k):
+        raise AssertionError("network call without a key")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert engine.cleanup_text("testo") == "testo"
+
+
 def test_cleanup_any_failure_falls_back_to_raw(quality_state, cleanup_enabled, monkeypatch):
     import urllib.request
 

@@ -130,6 +130,9 @@ CLEANUP_TIMEOUT = float(os.environ.get("VIBEVOICE_CLEANUP_TIMEOUT", "2.5"))
 CLEANUP_API_KEY = (
     os.environ.get("VIBEVOICE_CLEANUP_API_KEY") or os.environ.get("GROQ_API_KEY") or ""
 )
+# Key file fallback: LaunchAgent plists cannot read the shell env, and a secret
+# does not belong inside a plist — drop the key in this file (chmod 600) instead.
+CLEANUP_KEY_FILE = STATE_DIR / "cleanup_key"
 
 SAMPLE_RATE = 16000     # mlx_whisper expects 16 kHz mono
 CHANNELS = 1
@@ -400,7 +403,13 @@ def cleanup_text(text: str) -> str:
     global _CLEANUP_KEY_WARNED
     if not CLEANUP_ENABLED or not text.strip():
         return text
-    if not CLEANUP_API_KEY:
+    key = CLEANUP_API_KEY
+    if not key:
+        try:
+            key = CLEANUP_KEY_FILE.read_text().strip()
+        except Exception:
+            key = ""
+    if not key:
         if not _CLEANUP_KEY_WARNED:
             _CLEANUP_KEY_WARNED = True
             sys.stderr.write(
@@ -425,7 +434,7 @@ def cleanup_text(text: str) -> str:
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {CLEANUP_API_KEY}",
+                "Authorization": f"Bearer {key}",
             },
         )
         with urllib.request.urlopen(req, timeout=CLEANUP_TIMEOUT) as resp:
