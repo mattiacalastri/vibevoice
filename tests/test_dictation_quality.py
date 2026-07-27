@@ -230,6 +230,32 @@ def test_cleanup_prompt_includes_dictionary_terms(quality_state):
     assert "Kongline" in prompt and "Fathom" in prompt
 
 
+def test_cleanup_prompt_includes_recent_corrections_as_examples(quality_state, monkeypatch):
+    import json
+
+    monkeypatch.setattr(engine, "CORRECTIONS_FILE", engine.DICT_FILE.parent / "corrections.jsonl")
+    engine.CORRECTIONS_FILE.write_text(
+        json.dumps({"ts": 1.0, "raw": "ciao con line", "corrected": "ciao Kongline"}) + "\n"
+    )
+    prompt = engine._build_cleanup_prompt()
+    assert "ciao con line" in prompt and "ciao Kongline" in prompt
+
+
+def test_load_corrections_returns_newest_last_capped(quality_state, monkeypatch):
+    import json
+
+    monkeypatch.setattr(engine, "CORRECTIONS_FILE", engine.DICT_FILE.parent / "corrections.jsonl")
+    engine.CORRECTIONS_FILE.write_text(
+        "\n".join(
+            json.dumps({"ts": i, "raw": f"r{i}", "corrected": f"c{i}"}) for i in range(20)
+        )
+        + "\n"
+    )
+    pairs = engine._load_corrections(max_n=5)
+    assert len(pairs) == 5
+    assert pairs[-1]["raw"] == "r19"
+
+
 def test_process_utterance_records_cleanup_ms_when_enabled(
     quality_state, cleanup_enabled, monkeypatch
 ):

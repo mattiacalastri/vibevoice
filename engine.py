@@ -96,6 +96,7 @@ HISTORY_FILE = STATE_DIR / "history.jsonl"  # last 20 transcriptions, JSONL {"ts
 MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
 DICT_FILE = STATE_DIR / "dictionary.txt"  # control file: personal terms, one per line (user/tools write, engine reads)
 METRICS_FILE = STATE_DIR / "metrics.jsonl"  # per-utterance latency telemetry, JSONL, capped
+CORRECTIONS_FILE = STATE_DIR / "corrections.jsonl"  # control file: user corrections (tools write, engine reads)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -323,6 +324,28 @@ def transcribe(audio: np.ndarray) -> str:
 _CLEANUP_KEY_WARNED = False
 
 
+def _load_corrections(max_n: int = 5) -> list:
+    """Read the most recent user corrections (newest last); [] on any failure.
+
+    Written by tools/vibevoice_correct.py — the corrections loop. Fed to the
+    cleanup prompt as few-shot examples so a mistake, once corrected, stops
+    recurring.
+    """
+    try:
+        import json
+        pairs = []
+        for line in CORRECTIONS_FILE.read_text().splitlines()[-max_n:]:
+            try:
+                entry = json.loads(line)
+                if entry.get("raw") and entry.get("corrected"):
+                    pairs.append(entry)
+            except Exception:
+                pass
+        return pairs
+    except Exception:
+        return []
+
+
 def _build_cleanup_prompt() -> str:
     """System prompt for the cleanup LLM: literal post-processing, no invention.
 
@@ -346,6 +369,11 @@ def _build_cleanup_prompt() -> str:
     terms = load_dictionary()
     if terms:
         prompt += "\nGlossario: " + ", ".join(terms) + "."
+    pairs = _load_corrections()
+    if pairs:
+        prompt += "\nEsempi di correzioni fatte dall'utente (grezzo → corretto):"
+        for pair in pairs:
+            prompt += f'\n- "{pair["raw"]}" → "{pair["corrected"]}"'
     return prompt
 
 

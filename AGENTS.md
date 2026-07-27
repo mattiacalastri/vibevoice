@@ -79,6 +79,7 @@ own `autosend` flag.
 | `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
 | `~/.vibevoice/dictionary.txt` | personal terms, one per line, `#` comments — biases Whisper via `initial_prompt` (max `DICT_MAX_TERMS`) | user, external tools | engine (`load_dictionary()`) |
 | `~/.vibevoice/metrics.jsonl` | per-utterance latency telemetry (`stt_ms`, `total_ms`, …), JSONL capped at `METRICS_MAX` | engine | `tools/vibevoice_metrics.py` (p50/p90/p99 report) |
+| `~/.vibevoice/corrections.jsonl` | user corrections `{ts,raw,corrected}`, JSONL capped — few-shot examples for the cleanup prompt; new terms flow into `dictionary.txt` | `tools/vibevoice_correct.py` | engine (`_load_corrections()`) |
 | `~/.vibevoice/locked` | presence = pill stays visible (no auto-hide) | pill | pill |
 | `~/.vibevoice/robot_pos` | text: `x,y` — saved position of the floating robot widget (drag) | pill | pill |
 | `~/.vibevoice/tts` | presence = TTS-reactivity hook enabled (optional) | external TTS | pill |
@@ -329,6 +330,8 @@ available and keep it green. Match the existing comment density — the code fav
 | Waveform / text rendering | `vibevoice.py` → `PillView.drawRect_` |
 | Menu-bar master switch, engine start/stop | `vibevoice.py` → `_engine_running`, `_start_engine`, `_stop_engine` |
 | Auto-Return timing, target-app gating, one-shot logic | `autosend.py` → `AutoSendDaemon` |
+| Personal dictionary, LLM cleanup pass, latency telemetry | `engine.py` → `load_dictionary`, `cleanup_text`, `process_utterance`, `CLEANUP_*` constants |
+| Correcting the last dictation / growing the dictionary | `tools/vibevoice_correct.py` · report: `tools/vibevoice_metrics.py` |
 | Deeper data-flow / threading model | `docs/ARCHITECTURE.md` |
 | `.app` bundle layout, Info.plist identity, mic/AppleEvents usage strings | `build_app.sh` (locked by `tests/test_app_bundle.py`) |
 
