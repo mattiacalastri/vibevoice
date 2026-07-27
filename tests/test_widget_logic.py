@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vibevoice import widget_bar_levels, widget_led, WIDGET_BARS
+from vibevoice import widget_bar_color, widget_bar_levels, widget_led, WIDGET_BARS
 
 
 # ── widget_bar_levels ─────────────────────────────────────────────────────────
@@ -59,3 +59,19 @@ def test_led_recording_is_red_dominant():
 def test_led_listening_is_green_dominant():
     r, g, b = widget_led(state="idle", muted=False, engine_on=True)
     assert g > r and g > b
+
+
+# ── widget_bar_color ──────────────────────────────────────────────────────────
+
+def test_bar_color_red_only_near_clipping():
+    """Apple's AGC pushes normal speech well past 0.85 — red must mean actual
+    clipping, not a loud voice (feedback sess.9685: 'vedo troppo rosso')."""
+    r, g, b, _a = widget_bar_color(0.90, engine_on=True)
+    assert g > r, "0.90 must still be green"
+    r, g, b, _a = widget_bar_color(0.99, engine_on=True)
+    assert r > g, "clipping level must be red"
+
+
+def test_bar_color_engine_off_is_dim():
+    _r, _g, _b, a = widget_bar_color(0.5, engine_on=False)
+    assert a < 0.95

@@ -174,6 +174,17 @@ def widget_bar_levels(levels, n=WIDGET_BARS) -> list:
     return bars
 
 
+def widget_bar_color(lvl: float, engine_on: bool) -> tuple:
+    """(r, g, b, a) of one VU bar. Red means CLIPPING, not a loud voice:
+    Apple's AGC pushes normal speech well past 0.85, so the hot threshold sits
+    at the very top (feedback sess.9685: 'vedo troppo rosso')."""
+    if not engine_on:
+        return (0.20, 0.30, 0.24, 0.8)
+    if lvl > 0.96:
+        return (1.0, 0.25, 0.18, 0.95)
+    return (0.10 + 0.5 * lvl, 0.92, 0.30, 0.95)
+
+
 def widget_led(state: str, muted: bool, engine_on: bool) -> tuple:
     """(r, g, b) tint of the widget's status LED.
 
@@ -761,13 +772,8 @@ class HardwareView(NSView):
             x = dx0 + pad + i * (bw + gap)
             bh = max(1.6, lvl * (dh - 8.0))
             y = dy0 + (dh - bh) / 2.0
-            if not self.engine_on:
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.20, 0.30, 0.24, 0.8).set()
-            elif lvl > 0.85:
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.25, 0.18, 0.95).set()
-            else:
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    0.10 + 0.5 * lvl, 0.92, 0.30, 0.95).set()
+            cr, cg, cb, ca = widget_bar_color(lvl, self.engine_on)
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(cr, cg, cb, ca).set()
             NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                 NSMakeRect(x, y, bw, bh), 1.0, 1.0).fill()
 
