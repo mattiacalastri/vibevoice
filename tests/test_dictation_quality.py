@@ -138,3 +138,110 @@ def test_process_utterance_empty_transcription_writes_nothing(quality_state, mon
     assert engine.process_utterance(audio, t_end=None) == ""
     assert not engine.RAW_FILE.exists()
     assert not engine.METRICS_FILE.exists()
+
+
+# ── LLM cleanup pass (env-gated; degradation is contract) ────────────────────
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _chat_response(content: str) -> bytes:
+    import json
+
+    return json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+
+
+@pytest.fixture
+def cleanup_enabled(monkeypatch):
+    monkeypatch.setattr(engine, "CLEANUP_ENABLED", True)
+    monkeypatch.setattr(engine, "CLEANUP_API_KEY", "test-key")
+
+
+def test_cleanup_disabled_by_default_makes_no_network_call(quality_state, monkeypatch):
+    import urllib.request
+
+    def _boom(*a, **k):
+        raise AssertionError("network call with cleanup disabled")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert engine.CLEANUP_ENABLED is False  # default OFF: zero behavior change
+    assert engine.cleanup_text("ehm ciao a tutti") == "ehm ciao a tutti"
+
+
+def test_cleanup_success_returns_polished_text(quality_state, cleanup_enabled, monkeypatch):
+    import json
+    import urllib.request
+
+    seen = {}
+
+    def _fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        seen["payload"] = json.loads(req.data.decode())
+        return _FakeHTTPResponse(_chat_response("Ciao a tutti."))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    out = engine.cleanup_text("ehm ciao a tutti")
+
+    assert out == "Ciao a tutti."
+    assert seen["auth"] == "Bearer test-key"
+    assert seen["payload"]["model"] == engine.CLEANUP_MODEL
+    assert "ehm ciao a tutti" in json.dumps(seen["payload"])
+
+
+def test_cleanup_any_failure_falls_back_to_raw(quality_state, cleanup_enabled, monkeypatch):
+    import urllib.request
+
+    def _fail(*a, **k):
+        raise OSError("timeout")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fail)
+    assert engine.cleanup_text("testo grezzo") == "testo grezzo"
+
+
+def test_cleanup_hallucination_guard_rejects_bloated_output(
+    quality_state, cleanup_enabled, monkeypatch
+):
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _FakeHTTPResponse(_chat_response("bla " * 200)),
+    )
+    assert engine.cleanup_text("breve") == "breve"
+
+
+def test_cleanup_prompt_includes_dictionary_terms(quality_state):
+    engine.DICT_FILE.write_text("Kongline\nFathom\n")
+    prompt = engine._build_cleanup_prompt()
+    assert "Kongline" in prompt and "Fathom" in prompt
+
+
+def test_process_utterance_records_cleanup_ms_when_enabled(
+    quality_state, cleanup_enabled, monkeypatch
+):
+    import json
+
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "ehm ciao")
+    monkeypatch.setattr(engine, "cleanup_text", lambda text: "Ciao.")
+    audio = np.zeros(1600, dtype=np.float32)
+
+    text = engine.process_utterance(audio, t_end=None)
+
+    assert text == "Ciao."
+    assert engine.RAW_FILE.read_text() == "Ciao."  # what you see is what was pasted
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert "cleanup_ms" in entry

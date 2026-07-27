@@ -105,6 +105,18 @@ AUTOSEND = os.environ.get("VIBEVOICE_AUTOSEND", "1") == "1"
 AUTOSEND_RETURN = os.environ.get("VIBEVOICE_AUTOSEND_RETURN", "0") == "1"
 VP_ENABLED = os.environ.get("VIBEVOICE_VP", "1") == "1"  # macOS voice-processing capture
 
+# LLM cleanup pass (the Wispr-style rewrite). OFF by default: with
+# VIBEVOICE_CLEANUP unset the dictation path is byte-identical to today's.
+CLEANUP_ENABLED = os.environ.get("VIBEVOICE_CLEANUP", "0") == "1"
+CLEANUP_URL = os.environ.get(
+    "VIBEVOICE_CLEANUP_URL", "https://api.groq.com/openai/v1/chat/completions"
+)
+CLEANUP_MODEL = os.environ.get("VIBEVOICE_CLEANUP_MODEL", "llama-3.1-8b-instant")
+CLEANUP_TIMEOUT = float(os.environ.get("VIBEVOICE_CLEANUP_TIMEOUT", "2.5"))
+CLEANUP_API_KEY = (
+    os.environ.get("VIBEVOICE_CLEANUP_API_KEY") or os.environ.get("GROQ_API_KEY") or ""
+)
+
 SAMPLE_RATE = 16000     # mlx_whisper expects 16 kHz mono
 CHANNELS = 1
 BLOCKSIZE = 1600        # ~100 ms per audio block at 16 kHz
@@ -306,6 +318,88 @@ def transcribe(audio: np.ndarray) -> str:
                 pass
 
 
+# ── LLM cleanup pass (optional; degradation is contract) ─────────────────────
+
+_CLEANUP_KEY_WARNED = False
+
+
+def _build_cleanup_prompt() -> str:
+    """System prompt for the cleanup LLM: literal post-processing, no invention.
+
+    Derived from freeflow's battle-tested prompt; the personal dictionary is
+    injected as a glossary so misheard names snap to their canonical spelling.
+    """
+    prompt = (
+        "Sei un post-processore di dettatura vocale. Ricevi l'output grezzo di uno "
+        "speech-to-text in italiano e restituisci il testo pulito, pronto da incollare.\n"
+        "Compiti:\n"
+        "- Rimuovi i filler (ehm, cioè, tipo, diciamo) quando non portano significato.\n"
+        "- Correggi ortografia, grammatica e punteggiatura.\n"
+        "- Se una parola è una storpiatura evidente di un termine del glossario, "
+        "correggila con la grafia del glossario. Non inserire mai termini che il "
+        "parlante non ha detto.\n"
+        "- Preserva esattamente intento, tono e significato.\n"
+        "Regole di output:\n"
+        "- Restituisci SOLO il testo pulito, senza preamboli né commenti.\n"
+        "- Non aggiungere contenuti assenti dalla trascrizione."
+    )
+    terms = load_dictionary()
+    if terms:
+        prompt += "\nGlossario: " + ", ".join(terms) + "."
+    return prompt
+
+
+def cleanup_text(text: str) -> str:
+    """Polish a raw transcription with the configured LLM endpoint.
+
+    Returns the original text unchanged when disabled, unconfigured, on any
+    network/parse failure, or when the reply smells hallucinated (empty or
+    disproportionately long) — the cleanup is a bonus, never a dependency.
+    """
+    global _CLEANUP_KEY_WARNED
+    if not CLEANUP_ENABLED or not text.strip():
+        return text
+    if not CLEANUP_API_KEY:
+        if not _CLEANUP_KEY_WARNED:
+            _CLEANUP_KEY_WARNED = True
+            sys.stderr.write(
+                "VibeVoice: cleanup enabled but no API key "
+                "(VIBEVOICE_CLEANUP_API_KEY or GROQ_API_KEY) — skipping.\n"
+            )
+        return text
+    import json
+    import urllib.request
+    try:
+        payload = {
+            "model": CLEANUP_MODEL,
+            "temperature": 0,
+            "max_tokens": 512,
+            "messages": [
+                {"role": "system", "content": _build_cleanup_prompt()},
+                {"role": "user", "content": text},
+            ],
+        }
+        req = urllib.request.Request(
+            CLEANUP_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {CLEANUP_API_KEY}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=CLEANUP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out = (data["choices"][0]["message"]["content"] or "").strip()
+        # Anti-hallucination guard: a rewrite much longer than the source is
+        # the model adding content, not cleaning it.
+        if not out or len(out) > 3 * len(text) + 40:
+            return text
+        return out
+    except Exception as err:
+        sys.stderr.write(f"VibeVoice: cleanup failed, using raw text: {err}\n")
+        return text
+
+
 def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
     """Transcribe one finalized utterance and publish text + telemetry.
 
@@ -320,6 +414,11 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
     stt_ms = (time.monotonic() - t0) * 1000.0
     if not text:
         return ""
+    cleanup_ms = None
+    if CLEANUP_ENABLED:
+        t1 = time.monotonic()
+        text = cleanup_text(text)
+        cleanup_ms = (time.monotonic() - t1) * 1000.0
     write_raw(text)
     _append_history(text)
     entry = {
@@ -328,6 +427,8 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
         "chars": len(text),
         "stt_ms": round(stt_ms, 1),
     }
+    if cleanup_ms is not None:
+        entry["cleanup_ms"] = round(cleanup_ms, 1)
     if t_end is not None:
         entry["total_ms"] = round((time.monotonic() - t_end) * 1000.0, 1)
     _append_metrics(entry)

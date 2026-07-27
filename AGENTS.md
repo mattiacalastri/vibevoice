@@ -204,6 +204,11 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_AUTOSEND_RETURN` | `0` | press Return after pasting |
 | `VIBEVOICE_VP` | `1` | capture via macOS voice processing (AVAudioEngine + Apple AEC/NS/AGC — the full-duplex prerequisite); `0` forces sounddevice. Auto-falls back to sounddevice when AVFoundation is missing or the VP path fails at open time |
 | `VIBEVOICE_SILERO_MODEL` | *(unset)* | explicit path to a Silero VAD ONNX model; overrides the copy shipped with the `silero_vad` package. If the path doesn't exist it warns and cascades to the package model; with neither the model nor `onnxruntime` available the speech decision falls back to the RMS threshold (`VAD_THRESHOLD`) |
+| `VIBEVOICE_CLEANUP` | `0` | `1` enables the LLM cleanup pass after transcription (fillers out, punctuation, glossary spelling). Any failure — no key, timeout, bad reply — falls back to the raw text: the pass is a bonus, never a dependency |
+| `VIBEVOICE_CLEANUP_URL` | Groq chat completions | OpenAI-compatible endpoint for the cleanup pass |
+| `VIBEVOICE_CLEANUP_MODEL` | `llama-3.1-8b-instant` | model id sent to the cleanup endpoint |
+| `VIBEVOICE_CLEANUP_TIMEOUT` | `2.5` | seconds before the cleanup call is abandoned (raw text pasted instead) |
+| `VIBEVOICE_CLEANUP_API_KEY` | *(unset)* | bearer key for the endpoint; falls back to `GROQ_API_KEY` |
 
 ### Environment variables (pill)
 | Var | Default | Meaning |
