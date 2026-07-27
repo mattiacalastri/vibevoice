@@ -20,6 +20,9 @@ import engine
 def quality_state(tmp_path, monkeypatch):
     """Redirect the dictation-quality runtime files into a tmp dir."""
     monkeypatch.setattr(engine, "DICT_FILE", tmp_path / "dictionary.txt")
+    monkeypatch.setattr(engine, "RAW_FILE", tmp_path / "raw.txt")
+    monkeypatch.setattr(engine, "HISTORY_FILE", tmp_path / "history.jsonl")
+    monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
     return tmp_path
 
 
@@ -93,3 +96,45 @@ def test_transcribe_survives_unreadable_dictionary(quality_state, fake_whisper, 
     audio = np.zeros(1600, dtype=np.float32)
 
     assert engine.transcribe(audio) == "ciao mondo"
+
+
+# ── metrics.jsonl: the latency telemetry ─────────────────────────────────────
+
+def test_append_metrics_caps_lines(quality_state):
+    import json
+
+    for i in range(engine.METRICS_MAX + 30):
+        engine._append_metrics({"i": i})
+
+    lines = engine.METRICS_FILE.read_text().splitlines()
+    assert len(lines) == engine.METRICS_MAX
+    assert json.loads(lines[-1])["i"] == engine.METRICS_MAX + 29  # newest last
+
+
+def test_process_utterance_writes_metrics_with_latency_fields(quality_state, monkeypatch):
+    import json
+    import time as _time
+
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "ciao mondo")
+    audio = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)  # 1s of audio
+
+    # t_end is on the audio loop's clock (time.monotonic), not time.time().
+    text = engine.process_utterance(audio, t_end=_time.monotonic() - 0.5)
+
+    assert text == "ciao mondo"
+    assert engine.RAW_FILE.read_text() == "ciao mondo"
+    assert "ciao mondo" in engine.HISTORY_FILE.read_text()
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["audio_s"] == pytest.approx(1.0)
+    assert entry["chars"] == len("ciao mondo")
+    assert entry["stt_ms"] >= 0
+    assert entry["total_ms"] >= 500  # end-of-speech was 0.5s ago
+
+
+def test_process_utterance_empty_transcription_writes_nothing(quality_state, monkeypatch):
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "")
+    audio = np.zeros(1600, dtype=np.float32)
+
+    assert engine.process_utterance(audio, t_end=None) == ""
+    assert not engine.RAW_FILE.exists()
+    assert not engine.METRICS_FILE.exists()

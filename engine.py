@@ -95,6 +95,7 @@ RAW_FILE = STATE_DIR / "raw.txt"        # last transcription, plain text
 HISTORY_FILE = STATE_DIR / "history.jsonl"  # last 20 transcriptions, JSONL {"ts","text"}
 MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
 DICT_FILE = STATE_DIR / "dictionary.txt"  # control file: personal terms, one per line (user/tools write, engine reads)
+METRICS_FILE = STATE_DIR / "metrics.jsonl"  # per-utterance latency telemetry, JSONL, capped
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
 HISTORY_MAX = 20        # max lines in history.jsonl
 
 DICT_MAX_TERMS = 64     # terms fed to Whisper's initial_prompt (its context window is ~224 tokens)
+METRICS_MAX = 500       # max lines in metrics.jsonl
 
 VAD_THRESHOLD = 0.015   # RMS above this starts/sustains "recording"
 SILERO_ONSET = 0.5      # speech probability that turns the decision ON (hysteresis high)
@@ -177,6 +179,26 @@ def _append_history(text: str) -> None:
             pass
         lines.append(json.dumps({"ts": time.time(), "text": text}))
         HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+    except Exception:
+        pass
+
+
+def _append_metrics(entry: dict) -> None:
+    """Append one telemetry entry to metrics.jsonl, newest last, capped.
+
+    Same shape and guarantees as _append_history: never raises (it sits on the
+    transcription path). You don't improve what you don't measure — this is the
+    p99 ledger for the end-of-speech → text budget.
+    """
+    try:
+        import json
+        lines = []
+        try:
+            lines = METRICS_FILE.read_text().splitlines()
+        except OSError:
+            pass
+        lines.append(json.dumps(entry))
+        METRICS_FILE.write_text("\n".join(lines[-METRICS_MAX:]) + "\n")
     except Exception:
         pass
 
@@ -282,6 +304,34 @@ def transcribe(audio: np.ndarray) -> str:
                 os.unlink(wav_path)
             except Exception:
                 pass
+
+
+def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
+    """Transcribe one finalized utterance and publish text + telemetry.
+
+    The measured pipeline (STT now; the LLM cleanup pass hooks in here) —
+    kept module-level so it is testable without an Engine/mic. `t_end` is the
+    end-of-speech timestamp on the audio loop's clock (time.monotonic); with it
+    the metrics line carries total_ms, the end-of-speech → text-ready budget.
+    Returns the final text ("" when transcription produced nothing).
+    """
+    t0 = time.monotonic()
+    text = transcribe(audio)
+    stt_ms = (time.monotonic() - t0) * 1000.0
+    if not text:
+        return ""
+    write_raw(text)
+    _append_history(text)
+    entry = {
+        "ts": time.time(),
+        "audio_s": round(len(audio) / SAMPLE_RATE, 3),
+        "chars": len(text),
+        "stt_ms": round(stt_ms, 1),
+    }
+    if t_end is not None:
+        entry["total_ms"] = round((time.monotonic() - t_end) * 1000.0, 1)
+    _append_metrics(entry)
+    return text
 
 
 # ── Paste into frontmost app (pbcopy + CGEvent Cmd+V) ─────────────────────────
@@ -982,24 +1032,21 @@ class Engine:
         # Up to two transcriptions in flight; if both slots are busy, drop this utterance.
         if self._busy.acquire(blocking=False):
             threading.Thread(
-                target=self._transcribe_worker, args=(audio,), daemon=True
+                target=self._transcribe_worker, args=(audio, now), daemon=True
             ).start()
         else:
             write_state("idle")
 
-    def _transcribe_worker(self, audio: np.ndarray) -> None:
+    def _transcribe_worker(self, audio: np.ndarray, t_end: float = 0.0) -> None:
         """Transcribe, publish to raw.txt, and optionally autosend."""
         try:
             write_state("transcribing")
-            text = transcribe(audio)
-            if text:
-                write_raw(text)
-                _append_history(text)
-                if AUTOSEND:
-                    # Paste off the worker thread so we return to idle promptly.
-                    threading.Thread(
-                        target=autosend, args=(text,), daemon=True
-                    ).start()
+            text = process_utterance(audio, t_end=t_end or None)
+            if text and AUTOSEND:
+                # Paste off the worker thread so we return to idle promptly.
+                threading.Thread(
+                    target=autosend, args=(text,), daemon=True
+                ).start()
         finally:
             write_state("idle")
             write_levels(self._rms_history)
