@@ -34,12 +34,22 @@ PILL_LEVELS_BYTES = 60 * 4
 
 @pytest.fixture
 def engine_state(tmp_path, monkeypatch):
-    """Redirect the engine's state files into a tmp dir."""
+    """Redirect the engine's state files into a tmp dir.
+
+    EVERY module-level file the engine can write must be listed here: a full-flow
+    test reaches process_utterance, and a path left unredirected leaks into the
+    live ~/.vibevoice/ (scar sess.9685: seven fake entries in the real
+    metrics.jsonl, written by this very suite before METRICS_FILE was patched).
+    """
     monkeypatch.setattr(engine, "LEVELS_FILE", tmp_path / "levels.bin")
     monkeypatch.setattr(engine, "LEVELS_TMP", tmp_path / "levels.tmp")
     monkeypatch.setattr(engine, "STATE_FILE", tmp_path / "state")
     monkeypatch.setattr(engine, "RAW_FILE", tmp_path / "raw.txt")
     monkeypatch.setattr(engine, "MUTED_FILE", tmp_path / "muted")
+    monkeypatch.setattr(engine, "HISTORY_FILE", tmp_path / "history.jsonl")
+    monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
+    monkeypatch.setattr(engine, "DICT_FILE", tmp_path / "dictionary.txt")
+    monkeypatch.setattr(engine, "CORRECTIONS_FILE", tmp_path / "corrections.jsonl")
     return tmp_path
 
 
@@ -329,6 +339,43 @@ def test_silero_music_high_rms_low_prob_is_not_speech(make_silero):
     vad.submit(loud, rms=rms)
     assert _wait_until(lambda: len(fake.feeds) >= 3), "worker never consumed the block"
     assert vad.is_speech() is False
+
+
+def test_silero_hysteresis_band_holds_previous_decision(make_silero):
+    """Probabilities strictly inside the hysteresis band (SILERO_OFFSET < prob
+    < SILERO_ONSET) must HOLD the previous decision in both directions — the
+    anti-flap contract of SileroVad._infer (ARCHITECTURE.md §2.3). A regression
+    collapsing either edge into the band (e.g. `elif prob <= SILERO_OFFSET` →
+    `else`) flips these assertions."""
+    vad, fake = make_silero(0.9)  # start above onset
+    band = (engine.SILERO_OFFSET + engine.SILERO_ONSET) / 2
+    assert engine.SILERO_OFFSET < band < engine.SILERO_ONSET  # sanity: strictly inside
+    quiet = np.zeros(engine.BLOCKSIZE, dtype=np.float32)
+
+    # Onset edge: prob ≥ SILERO_ONSET turns the decision ON.
+    vad.submit(quiet, rms=0.0)
+    assert _wait_until(vad.is_speech), "onset never turned speech on"
+    # One 1600-sample block = exactly 3 full 512-frames: wait for the block to
+    # be fully consumed before mutating the probability (worker is async).
+    assert _wait_until(lambda: len(fake.feeds) == 3), "first block not fully consumed"
+
+    # Band while ON: the previous True must hold, not decay to False.
+    fake.prob = band
+    vad.submit(quiet, rms=0.0)
+    assert _wait_until(lambda: len(fake.feeds) == 6), "second block not fully consumed"
+    assert vad.is_speech() is True, "hysteresis band dropped the ON decision"
+
+    # Offset edge: prob ≤ SILERO_OFFSET turns the decision OFF.
+    fake.prob = 0.1
+    vad.submit(quiet, rms=0.0)
+    assert _wait_until(lambda: not vad.is_speech()), "offset never turned speech off"
+    assert _wait_until(lambda: len(fake.feeds) == 9), "third block not fully consumed"
+
+    # Band while OFF: the previous False must hold, not re-trigger True.
+    fake.prob = band
+    vad.submit(quiet, rms=0.0)
+    assert _wait_until(lambda: len(fake.feeds) == 12), "fourth block not fully consumed"
+    assert vad.is_speech() is False, "hysteresis band re-raised the OFF decision"
 
 
 def test_silero_absent_is_bit_identical_to_rms_threshold(monkeypatch):

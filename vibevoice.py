@@ -858,8 +858,16 @@ def _start_engine():
         env.setdefault("VIBEVOICE_AUTOSEND", "1" if cfg["autosend"] else "0")
         env.setdefault("VIBEVOICE_AUTOSEND_RETURN", "1" if cfg["autosend_return"] else "0")
         env.setdefault("VIBEVOICE_VP", "1" if cfg["vp"] else "0")
+        # Engine stderr → file, NOT devnull: the engine prints its capture
+        # backend, VAD choice and every transcription failure there — with
+        # devnull a deaf engine is indistinguishable from a healthy one
+        # (scar sess.9685: "non trascrive" with zero evidence anywhere).
+        try:
+            err = open(STATE_DIR / "engine.err", "ab")
+        except Exception:
+            err = subprocess.DEVNULL
         subprocess.Popen([_child_python(), str(ENGINE_PATH)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=err,
                          start_new_session=True, env=env)
     except Exception:
         pass

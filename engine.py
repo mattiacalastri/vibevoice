@@ -306,12 +306,17 @@ def save_wav(audio: np.ndarray, rate: int = SAMPLE_RATE) -> str:
 
 
 def transcribe(audio: np.ndarray) -> str:
-    """Transcribe a float32 mono buffer with mlx_whisper. Returns plain text."""
+    """Transcribe a float32 mono buffer with mlx_whisper. Returns plain text.
+
+    The buffer goes to mlx_whisper AS AN ARRAY: file paths are decoded through
+    ffmpeg, which is not on the launchd PATH — under a LaunchAgent every
+    dictation died with "No such file or directory: 'ffmpeg'" while the same
+    engine worked from a terminal. The array path needs no decoder at all
+    (and skips the temp-WAV roundtrip).
+    """
     if not _ensure_mlx_whisper():
         return ""
-    wav_path = None
     try:
-        wav_path = save_wav(audio)
         kwargs: dict = {"path_or_hf_repo": MODEL, "language": LANG}
         try:
             terms = load_dictionary()
@@ -321,18 +326,12 @@ def transcribe(audio: np.ndarray) -> str:
             # initial_prompt biases decoding toward these spellings — it is the
             # cheap half of Wispr-style context conditioning (names, jargon).
             kwargs["initial_prompt"] = "Glossario: " + ", ".join(terms) + "."
-        result = _MLX_WHISPER.transcribe(wav_path, **kwargs)
+        result = _MLX_WHISPER.transcribe(audio, **kwargs)
         text = (result.get("text") or "").strip()
         return text
     except Exception as err:
         sys.stderr.write(f"VibeVoice: transcription failed: {err}\n")
         return ""
-    finally:
-        if wav_path:
-            try:
-                os.unlink(wav_path)
-            except Exception:
-                pass
 
 
 # ── LLM cleanup pass (optional; degradation is contract) ─────────────────────

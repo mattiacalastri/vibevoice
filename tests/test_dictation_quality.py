@@ -27,13 +27,15 @@ def quality_state(tmp_path, monkeypatch):
 
 
 class _FakeWhisper:
-    """Stand-in for the mlx_whisper module: records transcribe() kwargs."""
+    """Stand-in for the mlx_whisper module: records transcribe() arguments."""
 
     def __init__(self, text: str = " ciao mondo "):
         self.text = text
         self.calls: list[dict] = []
+        self.audio_args: list = []
 
-    def transcribe(self, wav_path, **kwargs):
+    def transcribe(self, audio, **kwargs):
+        self.audio_args.append(audio)
         self.calls.append(kwargs)
         return {"text": self.text}
 
@@ -64,7 +66,20 @@ def test_load_dictionary_caps_terms(quality_state):
     assert len(engine.load_dictionary()) == engine.DICT_MAX_TERMS
 
 
-# ── transcribe() biasing ──────────────────────────────────────────────────────
+# ── transcribe() ──────────────────────────────────────────────────────────────
+
+def test_transcribe_passes_the_array_not_a_wav_path(quality_state, fake_whisper):
+    """mlx_whisper decodes file paths through ffmpeg, which is NOT on the
+    launchd PATH (scar sess.9685: every dictation died with 'No such file or
+    directory: ffmpeg'). Passing the float32 array skips ffmpeg entirely."""
+    audio = np.full(1600, 0.25, dtype=np.float32)
+
+    engine.transcribe(audio)
+
+    assert len(fake_whisper.audio_args) == 1
+    arg = fake_whisper.audio_args[0]
+    assert isinstance(arg, np.ndarray)
+    assert arg is audio  # the buffer itself, no temp-file roundtrip
 
 def test_transcribe_passes_dictionary_as_initial_prompt(quality_state, fake_whisper):
     engine.DICT_FILE.write_text("Kongline\nFathom\n")
