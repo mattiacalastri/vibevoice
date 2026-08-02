@@ -416,15 +416,27 @@ in §3 — and update this section if you do.
    app. It's fine in practice but is the place to look for input latency or
    process churn; any optimization must keep the window-signature check (it's
    what prevents a Return firing into a window you switched away from).
-6. **The streaming paste can repeat a word, and cannot take one back.** It types
-   the confirmed prefix as it is confirmed; the final transcription, which has
-   full context, may disagree with a word already on screen. `unstreamed_tail()`
-   aligns the two punctuation-insensitively and pastes from the divergence point
-   on — so a genuine divergence repeats a word or two rather than losing the end
-   of the sentence. Correcting with backspaces was rejected: synthetic deletes in
-   terminals and autocomplete fields destroy more than they fix. Punctuation the
-   stream typed can also differ from the final text (the stream saw less
-   context). `VIBEVOICE_STREAM_PASTE=0` trades the latency back for exactness.
+6. **The streaming paste cannot take a word back, so it would rather say too
+   little than too much.** It types confirmed words as they are confirmed; the
+   final transcription, which has full context, may disagree with what is
+   already on screen, and backspaces were rejected (synthetic deletes in
+   terminals and autocomplete fields destroy more than they fix). Three rules
+   contain it, all of them written after live damage on 2026-08-02:
+   - `unstreamed_tail()` anchors on the **end** of what was typed, not its
+     beginning. Prefix alignment was the first attempt: one corrected word near
+     the start dropped the alignment to zero and the whole sentence was pasted a
+     second time ("…che pattern e risolvili tranquillamente Ti dico i
+     ragionamenti che fai…"). No anchor found anywhere → paste **nothing**. A
+     sentence printed twice makes the text unusable; a missing tail is visible
+     and re-dictatable.
+   - **One word of lag.** The newest confirmed word still sits on the truncation
+     edge, where Whisper puts a full stop that full context will drop — the
+     screen read "lo sto testando. e sembra molto bello". A word is typed only
+     once another has been confirmed after it. The pill's draft shows everything;
+     only the typing waits.
+   - Punctuation already typed can still differ from the final text: the draft
+     re-punctuates itself, the app cannot. `VIBEVOICE_STREAM_PASTE=0` trades the
+     latency back for exactness.
 7. **Tests must disarm the outbound switches, not just redirect the files.** The
    `engine_state` fixture forces `AUTOSEND` and `STREAM_PASTE` off. When the
    streaming paste landed, both defaulted to on and the partial-pass tests typed

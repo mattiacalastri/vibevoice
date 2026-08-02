@@ -598,6 +598,36 @@ class LocalAgreement:
         self._prev = []
 
 
+PHANTOM_MAX_WORDS = 5   # above this a quiet blob is treated as real (quiet) speech
+
+
+def _is_phantom(audio: np.ndarray, text: str) -> bool:
+    """True when the audio was silent and the text is short — a hallucination.
+
+    Whisper does not answer "" to silence; it answers with training-set filler.
+    Found in the live history 2026-08-02 11:47:12: an utterance reading
+    "Grazie a tutti." that was never spoken, and which the paste would have
+    typed into whatever the user had open.
+
+    Both conditions are required. Audio alone would censor genuinely quiet
+    dictation; a phrase list alone would delete the same words when actually
+    spoken. Loudness is read at the 90th percentile, not the mean: one quiet
+    word inside a real sentence must not condemn it.
+    """
+    if len(text.split()) > PHANTOM_MAX_WORDS:
+        return False
+    try:
+        if audio.size < 2:
+            return False
+        # Per-block RMS, then p90 — the loudest tenth is what says "someone spoke".
+        n = max(1, audio.size // 160)         # ~10 ms blocks
+        blocks = np.array_split(audio, n)
+        rms = np.array([float(np.sqrt(np.mean(b.astype(np.float64) ** 2))) for b in blocks])
+        return bool(np.percentile(rms, 90) < VAD_THRESHOLD)
+    except Exception:
+        return False
+
+
 def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
     """Transcribe one finalized utterance and publish text + telemetry.
 
@@ -610,7 +640,7 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
     t0 = time.monotonic()
     text = transcribe(audio)
     stt_ms = (time.monotonic() - t0) * 1000.0
-    if not text:
+    if not text or _is_phantom(audio, text):
         return ""
     cleanup_ms = None
     if CLEANUP_ENABLED:
@@ -705,25 +735,49 @@ def type_text(text: str) -> bool:
         return False
 
 
+_ANCHOR_LEN = 3   # words of context that make a match trustworthy
+
+
 def unstreamed_tail(streamed: str, final: str) -> str:
     """The part of `final` the streaming paste has NOT already typed.
 
-    Aligns on words, punctuation-insensitively: the stream typed "autonomo"
-    while the final says "autonomo," — the same word, and repeating it would be
-    worse than the missing comma. Where the two genuinely diverge we keep the
-    tail from the divergence point on: losing the end of a sentence is worse
-    than a couple of repeated words (see AGENTS.md §9).
+    Anchors on the **end** of what was typed, not on its beginning. What is
+    already on screen ends somewhere inside the authoritative text, and that
+    junction is what we need; the start is the part the final decode is most
+    likely to have revised.
+
+    Prefix alignment was the first attempt and it failed in the wild
+    (2026-08-02): one corrected word near the beginning dropped the alignment to
+    zero and the whole sentence was pasted a second time. The user's screen read
+    "…che pattern e risolvili tranquillamente Ti dico i ragionamenti che fai…".
+
+    Comparison is punctuation- and case-insensitive: the stream typed "autonomo"
+    where the final says "autonomo," — the same word, and the missing comma
+    costs less than the repetition.
+
+    When no anchor is found anywhere we return "" — we cannot tell what is
+    already on screen, and a sentence printed twice makes the text unusable
+    while a missing tail is visible and re-dictatable.
     """
     if not streamed:
         return final
-    streamed_words = streamed.split()
+    typed = [_agreement_key(w) for w in streamed.split()]
+    typed = [w for w in typed if w]
     final_words = final.split()
-    aligned = 0
-    for a, b in zip(final_words, streamed_words):
-        if _agreement_key(a) != _agreement_key(b):
-            break
-        aligned += 1
-    return " ".join(final_words[aligned:])
+    keys = [_agreement_key(w) for w in final_words]
+    if not typed:
+        return final
+
+    # Try the longest anchor first, shrinking to a single word: the more context
+    # a match has, the more certain the junction.
+    for size in range(min(_ANCHOR_LEN, len(typed)), 0, -1):
+        anchor = typed[-size:]
+        # Search from the END: on a repeated phrase the latest occurrence is the
+        # one we just typed.
+        for start in range(len(keys) - size, -1, -1):
+            if keys[start:start + size] == anchor:
+                return " ".join(final_words[start + size:])
+    return ""
 
 
 def autosend(text: str) -> None:
@@ -1489,26 +1543,33 @@ class Engine:
             text = transcribe(audio)
             if gen != self._utt_gen:
                 return
-            lead = ""
             with self._agree_lock:
-                delta = self._agree.update(text)
+                self._agree.update(text)
                 draft = self._agree.confirmed
                 # Claim the chunk under the same lock that produced it, so two
                 # passes can never type overlapping text.
-                if delta and STREAM_PASTE and AUTOSEND and self._paste_queue_is_clear():
-                    lead = " " if (self._streamed and self._streamed_gen == gen) else ""
-                    self._streamed = draft
-                    self._streamed_gen = gen
-                else:
-                    delta = ""
+                to_type = ""
+                if STREAM_PASTE and AUTOSEND and self._paste_queue_is_clear():
+                    # One word of lag. The newest confirmed word still sits on
+                    # the truncation edge, where Whisper puts a full stop that
+                    # full context will drop ("lo sto testando." → "testando e").
+                    # The draft can re-punctuate itself; typed text cannot.
+                    typeable = draft.split()[:-1]
+                    already = (self._streamed.split()
+                               if self._streamed_gen == gen else [])
+                    if len(typeable) > len(already):
+                        lead = " " if already else ""
+                        to_type = lead + " ".join(typeable[len(already):])
+                        self._streamed = " ".join(typeable)
+                        self._streamed_gen = gen
             if gen != self._utt_gen:
                 return
             write_partial(draft)
-            if delta:
+            if to_type:
                 # Hold the Return daemon BEFORE typing: the gap it measures
                 # starts at the first keystroke, not after the last.
                 hold_autosend()
-                type_text(lead + delta)
+                type_text(to_type)
         except Exception as err:
             sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
         finally:

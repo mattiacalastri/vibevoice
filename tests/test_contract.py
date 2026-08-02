@@ -838,6 +838,39 @@ def test_agents_documents_barge_in_acceptance():
     assert "VibeVoice: VAD: silero" in sec
 
 
+# ── Hallucination guard: no audio, no words ──────────────────────────────────
+# Whisper does not return "" on silence — it returns its training-set filler.
+# Found in the user's own history.jsonl (2026-08-02 11:47:12): an utterance
+# reading "Grazie a tutti." that was never spoken, and which the paste would
+# have typed into whatever he had open.
+
+def test_silence_that_transcribes_to_filler_is_dropped(engine_state, monkeypatch):
+    """A near-silent blob whose text is short = hallucination, not speech."""
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "Grazie a tutti.")
+    silence = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)
+
+    assert engine.process_utterance(silence, t_end=None) == ""
+    assert not engine.RAW_FILE.exists(), "a phantom must not reach raw.txt"
+
+
+def test_quiet_but_long_transcription_is_kept(engine_state, monkeypatch):
+    """The guard keys on BOTH quiet audio and a short text: a real sentence
+    recorded quietly must survive, or the guard becomes a censor."""
+    long_text = " ".join(["parola"] * 12)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: long_text)
+    silence = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)
+
+    assert engine.process_utterance(silence, t_end=None) == long_text
+
+
+def test_audible_speech_is_never_dropped_however_short(engine_state, monkeypatch):
+    """Audio well above the VAD threshold is speech, whatever it says."""
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "Grazie a tutti.")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    assert engine.process_utterance(loud, t_end=None) == "Grazie a tutti."
+
+
 # ── Streaming: LocalAgreement-2 stabilizer (F3) ───────────────────────────────
 # A word is published only once two successive hypotheses agree on it. That is
 # what makes live text stable instead of flickering: Whisper re-decodes the whole
@@ -1081,11 +1114,36 @@ def test_unstreamed_tail_aligns_across_punctuation_drift():
     ) == "mentre il"
 
 
-def test_unstreamed_tail_keeps_the_tail_when_the_final_diverges_mid_sentence():
-    """Losing the end of a sentence is worse than a couple of repeated words."""
+def test_unstreamed_tail_anchors_on_the_END_of_what_was_typed():
+    """Verbatim from the wild, 2026-08-02. The stream typed a mangled early
+    reading; the final decode fixed it. Prefix alignment broke at word 1 and the
+    whole sentence was pasted a second time — the user's screen read
+    "…che pattern e risolvili tranquillamente Ti dico i ragionamenti che fai…".
+
+    What is already on screen ENDS somewhere inside the final text, so that is
+    where to look: anchor on the last words typed, not on the first.
+    """
+    streamed = "Però ti dico i ragionamenti che pattern e risolvili tranquillamente"
+    final = ("Ti dico i ragionamenti che fai, individua i pattern e risolvili "
+             "tranquillamente con tutta la tua conoscenza")
+    assert engine.unstreamed_tail(streamed, final) == "con tutta la tua conoscenza"
+
+
+def test_unstreamed_tail_refuses_to_paste_a_sentence_twice():
+    """No anchor anywhere = we cannot tell what is already on screen. Repeating
+    a whole sentence makes the text unusable; a missing tail is visible and
+    re-dictatable. Say nothing rather than say it twice."""
     assert engine.unstreamed_tail(
-        "il polpo ha molti", "il polpo ha otto tentacoli"
-    ) == "otto tentacoli"
+        "una cosa completamente diversa", "tutt'altra frase senza rapporto"
+    ) == ""
+
+
+def test_unstreamed_tail_survives_one_revised_word_in_the_middle():
+    """The common case: full context fixes a single word already typed. The
+    anchor is the tail, so the paste is still just the remainder."""
+    assert engine.unstreamed_tail(
+        "il polpo ha molti tentacoli", "il polpo ha otto tentacoli e pensa"
+    ) == "e pensa"
 
 
 @pytest.fixture
@@ -1111,7 +1169,44 @@ def test_stream_paste_types_the_confirmed_delta_while_still_speaking(engine_stat
         _drain_partials(eng)
 
     assert eng._speaking is True, "must have typed while the utterance was open"
-    assert "".join(typed) == "il polpo ha"
+    # "ha" is still the newest confirmed word — held back by one word of lag.
+    assert "".join(typed) == "il polpo"
+
+
+def test_stream_paste_holds_back_the_word_on_the_truncation_edge(engine_state, monkeypatch, typed):
+    """Whisper closes every truncated buffer with a full stop, so the newest
+    confirmed word carries punctuation that full context will drop. The pill's
+    draft re-punctuates itself; text already typed cannot. Seen in the wild
+    2026-08-02: "lo sto testando. e sembra molto bello".
+
+    So a word is typed only once ANOTHER word has been confirmed after it — by
+    then its punctuation is settled. The draft still shows everything.
+    """
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+
+    # Pass 1+2 confirm "sto testando." — the period is a truncation artefact.
+    # Pass 3+4 confirm "e sembra" and reveal it was never a sentence end.
+    hypotheses = iter([
+        "lo sto testando.",
+        "lo sto testando.",
+        "lo sto testando e sembra",
+        "lo sto testando e sembra",
+    ])
+    monkeypatch.setattr(engine, "transcribe", lambda audio: next(hypotheses, "lo sto testando e sembra"))
+
+    eng = engine.Engine()
+    for _ in range(4):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    landed = "".join(typed)
+    assert "testando." not in landed, f"typed the truncation-edge full stop: {landed!r}"
+    assert landed == "lo sto testando e", "one word of lag: 'sembra' is still on the edge"
+    # The draft is not held back — only the typing is.
+    assert engine.PARTIAL_FILE.read_text() == "lo sto testando e sembra"
 
 
 def test_stream_paste_separates_successive_chunks_with_a_space(engine_state, monkeypatch, typed):
@@ -1129,7 +1224,8 @@ def test_stream_paste_separates_successive_chunks_with_a_space(engine_state, mon
         eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
         _drain_partials(eng)
 
-    assert "".join(typed) == "il polpo ha otto"
+    # "otto" is the newest confirmed word: held back, it arrives with the final paste.
+    assert "".join(typed) == "il polpo ha"
 
 
 def test_final_paste_adds_only_the_tail_after_streaming(engine_state, monkeypatch, typed):
@@ -1144,7 +1240,7 @@ def test_final_paste_adds_only_the_tail_after_streaming(engine_state, monkeypatc
     for _ in range(2):
         eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
         _drain_partials(eng)
-    assert "".join(typed) == "il polpo"
+    assert "".join(typed) == "il", "one word of lag: 'polpo' is still on the edge"
 
     monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
     eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)

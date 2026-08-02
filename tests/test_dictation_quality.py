@@ -134,7 +134,9 @@ def test_process_utterance_writes_metrics_with_latency_fields(quality_state, mon
     import time as _time
 
     monkeypatch.setattr(engine, "transcribe", lambda audio: "ciao mondo")
-    audio = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)  # 1s of audio
+    # Audible on purpose: this test is about the latency fields, and a silent
+    # buffer with a short text is now dropped as a hallucination (_is_phantom).
+    audio = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)  # 1s of audio
 
     # t_end is on the audio loop's clock (time.monotonic), not time.time().
     text = engine.process_utterance(audio, t_end=_time.monotonic() - 0.5)
@@ -384,7 +386,9 @@ def test_process_utterance_records_cleanup_ms_when_enabled(
 
     monkeypatch.setattr(engine, "transcribe", lambda audio: "ehm ciao")
     monkeypatch.setattr(engine, "cleanup_text", lambda text: "Ciao.")
-    audio = np.zeros(1600, dtype=np.float32)
+    # Audible on purpose: this test is about the metrics fields, and a silent
+    # buffer with a short text is now dropped as a hallucination (_is_phantom).
+    audio = np.full(1600, 0.4, dtype=np.float32)
 
     text = engine.process_utterance(audio, t_end=None)
 
