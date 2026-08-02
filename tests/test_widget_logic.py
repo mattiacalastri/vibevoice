@@ -11,12 +11,44 @@ from __future__ import annotations
 import pytest
 
 from vibevoice import (
+    clamp_to_visible,
     first_run_defaults,
     widget_bar_color,
     widget_bar_levels,
     widget_led,
     WIDGET_BARS,
 )
+
+
+# ── a saved position must not become a trap ──────────────────────────────────
+# The widget restores WIDGET_POS with no screen constraint. Drag it onto an
+# external monitor, unplug, relaunch: the panel is born off-screen, and
+# toggling it off and on only calls orderFrontRegardless — it never
+# repositions. With SHOW_PILL False that is the entire floating surface, and
+# the only cure was deleting a file by hand. Found by review 2026-08-02.
+
+def test_a_position_on_screen_is_left_alone():
+    screens = [(0.0, 0.0, 1440.0, 900.0)]
+    assert clamp_to_visible(200.0, 300.0, 300.0, 90.0, screens) == (200.0, 300.0)
+
+
+def test_a_position_from_a_vanished_monitor_comes_back():
+    """The external screen is gone; the saved origin is far outside it."""
+    screens = [(0.0, 0.0, 1440.0, 900.0)]
+    x, y = clamp_to_visible(3200.0, 1400.0, 300.0, 90.0, screens)
+    assert 0.0 <= x <= 1440.0 - 300.0
+    assert 0.0 <= y <= 900.0 - 90.0
+
+
+def test_a_second_monitor_is_still_allowed():
+    """Clamping must not drag the widget home from a screen that is present."""
+    screens = [(0.0, 0.0, 1440.0, 900.0), (1440.0, 0.0, 1920.0, 1080.0)]
+    assert clamp_to_visible(2000.0, 500.0, 300.0, 90.0, screens) == (2000.0, 500.0)
+
+
+def test_no_screens_at_all_changes_nothing():
+    """Never invent a position when we cannot know where the screens are."""
+    assert clamp_to_visible(50.0, 60.0, 300.0, 90.0, []) == (50.0, 60.0)
 
 
 # ── first run: an app you open must show you something ───────────────────────

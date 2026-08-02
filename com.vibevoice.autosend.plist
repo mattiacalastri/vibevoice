@@ -22,7 +22,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>__PYTHON__</string>
         <string>__HOME__/projects/vibevoice/autosend.py</string>
     </array>
 

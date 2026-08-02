@@ -150,6 +150,33 @@ SHOW_PILL = False
 CONFIGURED_FLAG = STATE_DIR / "configured"  # presence = this state dir has been set up once
 
 
+def clamp_to_visible(x, y, w, h, screens):
+    """Pull a saved window origin back onto a screen that actually exists.
+
+    A position is restored verbatim, so dragging the widget onto an external
+    monitor and unplugging it leaves the panel born off-screen — and toggling it
+    off and on only re-orders the existing panel, never repositions it. With
+    SHOW_PILL False that is the whole floating surface, and the only cure was
+    deleting `widget_pos` by hand.
+
+    `screens` is a list of (origin_x, origin_y, width, height). An origin that
+    sits on any of them is left exactly where the user put it: a second monitor
+    is a legitimate home. With no screens known, change nothing — never invent a
+    position from ignorance.
+    """
+    try:
+        if not screens:
+            return (x, y)
+        for sx, sy, sw, sh in screens:
+            if sx <= x <= sx + sw - min(w, sw) and sy <= y <= sy + sh - min(h, sh):
+                return (x, y)
+        sx, sy, sw, sh = screens[0]
+        return (min(max(x, sx), sx + max(sw - w, 0)),
+                min(max(y, sy), sy + max(sh - h, 0)))
+    except Exception:
+        return (x, y)
+
+
 def first_run_defaults(state_dir) -> list:
     """Turn on what a brand-new install must show, exactly once.
 
@@ -1000,8 +1027,18 @@ def _toggle_autosend():
             subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not _autosend_running():
+                # Keep the daemon's stderr, for the same reason _start_engine
+                # does 90 lines up (scar sess.9685): with devnull a deaf daemon
+                # is indistinguishable from a healthy one. Everything it says —
+                # "skip — paused by flag", "window changed", osascript errors,
+                # a missing pynput — was being thrown away, which is precisely
+                # what made a swallowed Return impossible to diagnose.
+                try:
+                    err = open(STATE_DIR / "autosend.err", "ab")
+                except Exception:
+                    err = subprocess.DEVNULL
                 subprocess.Popen([_child_python(), str(AUTOSEND_PATH)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=err,
                                  start_new_session=True, env=_clean_child_env())
     except Exception:
         pass
@@ -1095,6 +1132,15 @@ class Controller(NSObject):
         try:
             sx, sy = WIDGET_POS.read_text().strip().split(",")
             x, y = float(sx), float(sy)
+            # The saved berth may belong to a monitor that is no longer attached.
+            # Restoring it verbatim buries the widget off-screen, and the menu
+            # toggle only re-orders the panel — it never moves it — so the only
+            # cure was deleting widget_pos by hand.
+            screens = []
+            for s in (NSScreen.screens() or []):
+                f = s.frame()
+                screens.append((f.origin.x, f.origin.y, f.size.width, f.size.height))
+            x, y = clamp_to_visible(x, y, WIDGET_W, WIDGET_H, screens)
         except Exception:
             pass
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
@@ -1592,14 +1638,30 @@ class Controller(NSObject):
         except Exception:
             return ""
 
+    # A draft older than this was left behind by an engine that died without
+    # running its handler (SIGKILL, crash, OOM). Comfortably longer than
+    # MAX_DUR + SILENCE_SEC, so a slow real utterance is never mistaken for one.
+    _PARTIAL_STALE_S = 25.0
+
     def _read_partial(self):
         """The engine's live draft, or None when no utterance is in flight.
 
         The distinction matters: absent = fall back to the last finished
         sentence; present-but-empty = you ARE speaking and nothing is stable
         yet, so show nothing rather than the previous dictation.
+
+        A draft that has stopped changing is treated as absent. An engine killed
+        mid-utterance leaves both `state = recording` and `partial.txt` behind,
+        and the pill then refreshes `last_voice` on every tick, so it never
+        fades: a red LED, frozen VU bars and a dead draft at 24 fps with no
+        engine alive, curable only by killing the pill. Age is the honest
+        signal — `_engine_running()` is `pgrep -f engine.py`, which matches any
+        long-lived process with that string in argv, including an editor open on
+        the file (review 2026-08-02).
         """
         try:
+            if time.time() - PARTIAL_TXT.stat().st_mtime > self._PARTIAL_STALE_S:
+                return None
             return PARTIAL_TXT.read_text().strip()
         except OSError:
             return None

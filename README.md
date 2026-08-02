@@ -313,12 +313,19 @@ transcribe → paste stack. You don't need a separate engine LaunchAgent. Set th
 key to `0` (or remove it) if you'd rather flip the engine on with the 🎙 menu-bar
 toggle.
 
-The template uses a `__HOME__` placeholder — **replace it with your absolute home
-directory path** (e.g. `/Users/yourname`) before installing:
+The template uses two placeholders, `__HOME__` and `__PYTHON__` — **replace both
+before installing**.
+
+`__PYTHON__` must be the interpreter you installed the requirements into, and it
+is not `/usr/bin/python3`: the system python (3.9 on macOS 12–15) has neither
+`pynput` nor `AppKit`, so the daemon dies on import and `KeepAlive` relaunches
+the corpse every 10 seconds, forever, with `~/.vibevoice/autosend.err` as the
+only trace. The template used to hardcode it, which meant anyone following these
+instructions never had a working auto-Return daemon.
 
 ```bash
 cp com.vibevoice.pill.plist ~/Library/LaunchAgents/
-# edit the copy: replace every __HOME__ with your home path
+# edit the copy: __HOME__ → your home path, __PYTHON__ → `which python3`
 launchctl load ~/Library/LaunchAgents/com.vibevoice.pill.plist
 ```
 

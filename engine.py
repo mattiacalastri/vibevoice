@@ -1938,6 +1938,9 @@ def main() -> int:
         engine.stop()
     finally:
         write_state("idle")
+        # Stopping mid-utterance otherwise leaves a draft on disk claiming a
+        # live utterance while the state says idle (review 2026-08-02).
+        clear_partial()
     return 0
 
 
