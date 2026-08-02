@@ -45,6 +45,7 @@ STATE-FILE CONTRACT (shared pill <-> engine, under ~/.vibevoice/):
   ~/.vibevoice/state       text file, one of: idle | recording | transcribing
   ~/.vibevoice/levels.bin  60 float32 little-endian (RMS 0..1), atomic write
   ~/.vibevoice/raw.txt     last transcription, plain text (just the sentence)
+  ~/.vibevoice/partial.txt live draft while you are still speaking (absent = none)
   ~/.vibevoice/history.jsonl  last 20 transcriptions, JSONL {"ts","text"}, newest last
 
 The engine WRITES these files; the pill READS them.
@@ -122,6 +123,7 @@ STATE_DIR  = Path(os.path.expanduser("~/.vibevoice"))
 STATE_FILE = STATE_DIR / "state"        # idle | recording | transcribing
 LEVELS_BIN = STATE_DIR / "levels.bin"   # 60 float32 LE (RMS 0..1)
 RAW_TXT    = STATE_DIR / "raw.txt"       # last transcription (plain text)
+PARTIAL_TXT = STATE_DIR / "partial.txt"  # live draft while speaking (absent = nothing in flight)
 # control files (the pill writes these; not engine-owned state):
 MUTED_FILE  = STATE_DIR / "muted"        # presence = mic paused (engine reads, stays alive)
 LOCKED_FILE = STATE_DIR / "locked"       # presence = pill stays visible (pill-only, no auto-hide)
@@ -1552,6 +1554,20 @@ class Controller(NSObject):
         except Exception:
             return ""
 
+    def _read_partial(self):
+        """The engine's live draft, or None when no utterance is in flight.
+
+        The distinction matters: absent = fall back to the last finished
+        sentence; present-but-empty = you ARE speaking and nothing is stable
+        yet, so show nothing rather than the previous dictation.
+        """
+        try:
+            return PARTIAL_TXT.read_text().strip()
+        except OSError:
+            return None
+        except Exception:
+            return None
+
     def _tts_speaking(self):
         """Return the slice of the sentence already spoken by an external TTS (a
         typewriter synced to the audio), or '' when not speaking / feature off.
@@ -1686,7 +1702,11 @@ class Controller(NSObject):
             # RMS), or when the engine is recording/transcribing.
             if raw > VOICE_THRESH or state in ("recording", "transcribing"):
                 self.last_voice = time.time()
-            text_now = self._read_text()
+            # While the utterance is still open the LIVE draft wins: words appear
+            # as they are spoken instead of after the trailing silence. Showing
+            # the previous sentence during a new dictation would be a lie.
+            live = self._read_partial() if state == "recording" else None
+            text_now = live if live is not None else self._read_text()
             hold = 2.5 if text_now else IDLE_HIDE_S   # with text it stays visible to click copy
             active = (time.time() - self.last_voice) <= hold
             text = text_now if active else ""

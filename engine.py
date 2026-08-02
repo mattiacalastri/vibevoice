@@ -75,6 +75,7 @@
 
 import os
 import queue
+import re
 import struct
 import sys
 import tempfile
@@ -110,6 +111,8 @@ MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (p
 DICT_FILE = STATE_DIR / "dictionary.txt"  # control file: personal terms, one per line (user/tools write, engine reads)
 METRICS_FILE = STATE_DIR / "metrics.jsonl"  # per-utterance latency telemetry, JSONL, capped
 CORRECTIONS_FILE = STATE_DIR / "corrections.jsonl"  # control file: user corrections (tools write, engine reads)
+PARTIAL_FILE = STATE_DIR / "partial.txt"  # live draft while speaking; absent = nothing in flight
+PARTIAL_TMP = STATE_DIR / "partial.tmp"   # staging for atomic replace
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -152,7 +155,14 @@ SILERO_OFFSET = 0.35    # probability that turns it OFF (hysteresis low; in betw
 SILERO_FRAME = 512      # samples per Silero inference frame at 16 kHz (model contract)
 SILERO_CONTEXT = 64     # context samples prepended to each frame (v5 ONNX contract)
 SILERO_QUEUE_MAX = 32   # submit()→worker backlog cap; beyond this, blocks are dropped
-SILENCE_SEC = 1.5       # trailing silence that ends an utterance
+SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing silence that ends an utterance (lower = faster paste, but a mid-sentence pause splits the utterance)
+# Streaming (F3): re-decode the open utterance while it is still being spoken so
+# text exists BEFORE the trailing silence expires. Without it the first word can
+# only appear SILENCE_SEC after you stop talking — that wait is the architecture,
+# not a tunable. The partial pass is a bonus: any failure leaves the final,
+# authoritative transcription untouched.
+STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
+PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
 MIN_DUR = 0.4           # discard utterances shorter than this (seconds)
 MAX_DUR = 15.0          # force finalize after this many seconds (short enough to keep each blob within the recognizer's comfort window + sustain rhythm on long dictation)
 PRE_ROLL_BLOCKS = 5     # blocks of audio kept before speech onset
@@ -192,6 +202,29 @@ def write_raw(text: str) -> None:
     """Write the last transcription as plain text (sentence only, no metadata)."""
     try:
         RAW_FILE.write_text(text)
+    except Exception:
+        pass
+
+
+def write_partial(text: str) -> None:
+    """Publish the live draft of the utterance being spoken (plain text).
+
+    Atomic like levels.bin: the pill reads this on a timer and must never catch
+    half a sentence. Provisional by definition — raw.txt stays the authority.
+    """
+    try:
+        PARTIAL_TMP.write_text(text)
+        os.replace(PARTIAL_TMP, PARTIAL_FILE)
+    except Exception:
+        pass
+
+
+def clear_partial() -> None:
+    """Remove the live draft. Absence of the file IS the 'nothing in flight' signal."""
+    try:
+        PARTIAL_FILE.unlink()
+    except FileNotFoundError:
+        pass
     except Exception:
         pass
 
@@ -447,6 +480,72 @@ def cleanup_text(text: str) -> str:
     except Exception as err:
         sys.stderr.write(f"VibeVoice: cleanup failed, using raw text: {err}\n")
         return text
+
+
+# ── LocalAgreement-2: turning unstable hypotheses into stable text ───────────
+
+_AGREE_STRIP = re.compile(r"[^\w']+", re.UNICODE)
+
+
+def _agreement_key(word: str) -> str:
+    """Comparison key for one word: no punctuation, case-folded.
+
+    Whisper re-punctuates and re-capitalizes its own output as the buffer grows
+    ("Ciao mondo" → "ciao, mondo come stai"). Comparing glyphs would find almost
+    no agreement; comparing words finds the real one.
+    """
+    return _AGREE_STRIP.sub("", word).casefold()
+
+
+class LocalAgreement:
+    """Stabilizer for streaming ASR (LocalAgreement-2, Liu et al. / whisper-streaming).
+
+    A word is published only once **two successive hypotheses agree** on it. Each
+    partial pass re-decodes the whole open utterance, so Whisper is free to rewrite
+    its tail — the tail is never trustworthy, the agreed prefix is. This is what
+    buys "text appears as you speak" without the flicker of raw partials.
+
+    Pure and synchronous on purpose: no threads, no I/O, no model — testable
+    without a microphone.
+    """
+
+    def __init__(self) -> None:
+        self._committed: list[str] = []   # surface forms, first-seen spelling wins
+        self._prev: list[str] = []        # previous hypothesis, for the agreement
+
+    def update(self, hypothesis: str) -> str:
+        """Feed a fresh full-utterance hypothesis; return the newly committed words.
+
+        Returns "" when this pass confirms nothing new. Never retracts: a shorter
+        or divergent hypothesis leaves already-published text alone (un-saying a
+        word the user has read is worse than a late one).
+        """
+        words = hypothesis.split()
+        agreed: list[str] = []
+        for fresh_word, prev_word in zip(words, self._prev):
+            if _agreement_key(fresh_word) != _agreement_key(prev_word):
+                break
+            # Keep the spelling from the pass that saw it FIRST: the draft the
+            # user is reading must not re-punctuate itself under their eyes.
+            # The final transcription (raw.txt) is the one with full context.
+            agreed.append(prev_word)
+        self._prev = words
+
+        if len(agreed) <= len(self._committed):
+            return ""
+        fresh = agreed[len(self._committed):]
+        self._committed = self._committed + fresh
+        return " ".join(fresh)
+
+    @property
+    def confirmed(self) -> str:
+        """Everything published so far for this utterance."""
+        return " ".join(self._committed)
+
+    def reset(self) -> None:
+        """Start a new utterance. Utterance N's prefix must not leak into N+1."""
+        self._committed = []
+        self._prev = []
 
 
 def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
@@ -1025,6 +1124,15 @@ class Engine:
         # start(), is_speech() is exactly the legacy RMS-threshold decision.
         self._vad = SileroVad()
 
+        # Streaming (F3). One partial pass at a time — the partial has its own
+        # slot so it can never starve the two final-transcription slots, and a
+        # slow pass drops its turn instead of queueing up behind itself.
+        self._agree = LocalAgreement()
+        self._agree_lock = threading.Lock()   # never taken from inside _lock (invariant #3)
+        self._partial_busy = threading.Semaphore(1)
+        self._t_partial = 0.0                 # monotonic time of the last partial dispatch
+        self._utt_gen = 0                     # bumped on every open/close: makes in-flight partials stale
+
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
 
@@ -1123,6 +1231,8 @@ class Engine:
             self._vad.submit(block, rms)
             speech = self._vad.is_speech()
             do_finalize = False
+            partial_blocks = None   # set when a streaming pass is due this block
+            partial_gen = 0
 
             with self._lock:
                 # Update level history; emit levels.bin while recording.
@@ -1139,12 +1249,21 @@ class Engine:
                         self._speaking = True
                         self._t_start = now
                         self._buf = list(self._pre)
+                        self._utt_gen += 1     # any partial still in flight is now stale
+                        self._t_partial = now
                         # Defer the state write until outside the lock.
                         do_finalize = "start"  # type: ignore[assignment]
                     self._t_silence = None
                     self._buf.append(block)
                     if now - self._t_start >= MAX_DUR:
                         do_finalize = "finalize"  # type: ignore[assignment]
+                    elif STREAMING and now - self._t_partial >= PARTIAL_INTERVAL:
+                        # Due for a streaming pass. Snapshot the block LIST only
+                        # (references, no audio copy) — the concatenate happens
+                        # on the worker, never on the audio thread.
+                        self._t_partial = now
+                        partial_blocks = list(self._buf)
+                        partial_gen = self._utt_gen
                 else:
                     # Silence.
                     self._pre.append(block)
@@ -1159,8 +1278,21 @@ class Engine:
             if do_finalize == "start":  # type: ignore[comparison-overlap]
                 write_state("recording")
                 write_levels(self._rms_history)
+                with self._agree_lock:
+                    self._agree.reset()
+                clear_partial()
             elif do_finalize == "finalize":  # type: ignore[comparison-overlap]
                 self._finalize(now)
+                return
+
+            # Streaming pass: one slot, non-blocking. If the previous pass is
+            # still decoding we simply skip this turn — a partial is a bonus.
+            if partial_blocks is not None and self._partial_busy.acquire(blocking=False):
+                threading.Thread(
+                    target=self._partial_worker,
+                    args=(partial_blocks, partial_gen),
+                    daemon=True,
+                ).start()
         except Exception:
             # The audio callback must never raise.
             pass
@@ -1179,6 +1311,12 @@ class Engine:
             self._speaking = False
             self._t_silence = None
             self._buf = []
+            self._utt_gen += 1  # partials still decoding are stale from here on
+
+        # The draft has served its purpose: raw.txt is about to become the
+        # authority. (The pill only renders the draft while state == recording,
+        # so a partial that lands in the microseconds after this is invisible.)
+        clear_partial()
 
         # Too short to be real speech — drop it silently.
         if dur < MIN_DUR:
@@ -1196,6 +1334,31 @@ class Engine:
             ).start()
         else:
             write_state("idle")
+
+    def _partial_worker(self, blocks: list, gen: int) -> None:
+        """Re-decode the still-open utterance and publish its stable prefix.
+
+        Best-effort by contract: any failure here leaves the final transcription
+        path untouched — the user loses live text for one pass, never the
+        sentence. `gen` guards against publishing a draft for an utterance that
+        has already been closed or replaced while we were decoding.
+        """
+        try:
+            audio = (
+                np.concatenate(blocks) if blocks else np.zeros(1, dtype=np.float32)
+            )
+            text = transcribe(audio)
+            if gen != self._utt_gen:
+                return
+            with self._agree_lock:
+                self._agree.update(text)
+                draft = self._agree.confirmed
+            if gen == self._utt_gen:
+                write_partial(draft)
+        except Exception as err:
+            sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
+        finally:
+            self._partial_busy.release()
 
     _PASTE_ORDER_TIMEOUT = 8.0  # a wedged predecessor must not dam the queue forever
 

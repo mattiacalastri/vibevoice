@@ -50,6 +50,8 @@ def engine_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
     monkeypatch.setattr(engine, "DICT_FILE", tmp_path / "dictionary.txt")
     monkeypatch.setattr(engine, "CORRECTIONS_FILE", tmp_path / "corrections.jsonl")
+    monkeypatch.setattr(engine, "PARTIAL_FILE", tmp_path / "partial.txt")
+    monkeypatch.setattr(engine, "PARTIAL_TMP", tmp_path / "partial.tmp")
     return tmp_path
 
 
@@ -782,3 +784,218 @@ def test_agents_documents_barge_in_acceptance():
     # Measurable startup evidence that VP + Silero are the active paths.
     assert "VibeVoice: capture: voice-processing" in sec
     assert "VibeVoice: VAD: silero" in sec
+
+
+# ── Streaming: LocalAgreement-2 stabilizer (F3) ───────────────────────────────
+# A word is published only once two successive hypotheses agree on it. That is
+# what makes live text stable instead of flickering: Whisper re-decodes the whole
+# buffer every pass and freely rewrites its own tail, so the tail is never
+# trustworthy — the agreed prefix is.
+
+def test_local_agreement_publishes_nothing_on_the_first_hypothesis():
+    """One hypothesis has nothing to agree with — it is all still tentative."""
+    agree = engine.LocalAgreement()
+    assert agree.update("il polpo ha otto") == ""
+    assert agree.confirmed == ""
+
+
+def test_local_agreement_confirms_only_the_agreed_prefix():
+    """Two hypotheses agree on 'il polpo ha' — the divergent tail stays tentative."""
+    agree = engine.LocalAgreement()
+    agree.update("il polpo ha otto")
+    assert agree.update("il polpo ha molti tentacoli") == "il polpo ha"
+    assert agree.confirmed == "il polpo ha"
+
+
+def test_local_agreement_emits_each_word_exactly_once():
+    """Successive updates return only the delta — never re-emit the prefix."""
+    agree = engine.LocalAgreement()
+    agree.update("il polpo")
+    agree.update("il polpo ha otto")          # confirms "il polpo"
+    delta = agree.update("il polpo ha otto tentacoli")  # confirms "ha otto"
+    assert delta == "ha otto"
+    assert agree.confirmed == "il polpo ha otto"
+
+
+def test_local_agreement_never_retracts_a_confirmed_word():
+    """A later hypothesis that contradicts confirmed text must not un-say it."""
+    agree = engine.LocalAgreement()
+    agree.update("il polpo ha")
+    agree.update("il polpo ha")               # confirms all three
+    assert agree.update("il") == ""           # shorter/divergent: no retraction
+    assert agree.confirmed == "il polpo ha"
+
+
+def test_local_agreement_matches_across_punctuation_and_case_drift():
+    """Whisper re-punctuates as context grows; agreement is on words, not glyphs."""
+    agree = engine.LocalAgreement()
+    agree.update("Ciao mondo")
+    assert agree.update("ciao, mondo come stai") == "Ciao mondo"
+
+
+def test_local_agreement_reset_starts_a_new_utterance_clean():
+    """Utterance N+1 must not inherit the confirmed prefix of utterance N."""
+    agree = engine.LocalAgreement()
+    agree.update("prima frase")
+    agree.update("prima frase")
+    agree.reset()
+    assert agree.confirmed == ""
+    assert agree.update("seconda") == ""
+
+
+# ── Streaming: the partial.txt contract file ──────────────────────────────────
+
+def test_partial_roundtrip(engine_state):
+    """partial.txt is plain text, like raw.txt — the live sentence so far."""
+    engine.write_partial("il polpo ha otto")
+    assert engine.PARTIAL_FILE.read_text() == "il polpo ha otto"
+
+
+def test_partial_write_is_atomic(engine_state):
+    """Written via tmp + os.replace: the pill never sees a torn sentence."""
+    engine.write_partial("una frase intera")
+    assert not engine.PARTIAL_TMP.exists()
+
+
+def test_clear_partial_removes_the_file(engine_state):
+    """No file = nothing live to show. Absence is the 'no partial' signal."""
+    engine.write_partial("qualcosa")
+    engine.clear_partial()
+    assert not engine.PARTIAL_FILE.exists()
+
+
+def test_clear_partial_is_idempotent(engine_state):
+    """Clearing twice (or before any write) must never raise."""
+    engine.clear_partial()
+    engine.clear_partial()
+    assert not engine.PARTIAL_FILE.exists()
+
+
+# ── Streaming: the engine publishes partials WHILE speech is still going ──────
+
+def _speech_block(level: float = 0.5) -> np.ndarray:
+    return np.full((engine.BLOCKSIZE, 1), level, dtype=np.float32)
+
+
+def _drain_partials(eng, timeout: float = 5.0) -> None:
+    """Wait for the single partial slot to be free again (worker finished)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if eng._partial_busy.acquire(blocking=False):
+            eng._partial_busy.release()
+            return
+        time.sleep(0.01)
+    raise AssertionError("partial worker never finished")
+
+
+def test_engine_publishes_a_partial_while_still_speaking(engine_state, monkeypatch):
+    """The whole point: text exists BEFORE the utterance is finalized."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)  # every block
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(3):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert eng._speaking is True, "utterance must still be open"
+    assert engine.STATE_FILE.read_text() == "recording"
+    assert engine.PARTIAL_FILE.read_text() == "il polpo ha"
+
+
+def test_partial_pass_never_writes_raw_or_history(engine_state, monkeypatch):
+    """Partials are provisional: only a finalized utterance may touch raw.txt."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "provvisorio")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert not engine.RAW_FILE.exists()
+    assert not engine.HISTORY_FILE.exists()
+
+
+def test_finalize_clears_the_partial(engine_state, monkeypatch):
+    """When the real text lands in raw.txt the live draft must disappear."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "frase")
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    _drain_partials(eng)
+    assert engine.PARTIAL_FILE.exists()
+
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    assert not engine.PARTIAL_FILE.exists()
+
+
+def test_new_utterance_does_not_inherit_the_previous_partial(engine_state, monkeypatch):
+    """Utterance N+1 starts from an empty draft, not from N's confirmed prefix."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "prima")
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    _drain_partials(eng)
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    assert eng._agree.confirmed == "", "stabilizer must reset at utterance onset"
+
+
+def test_streaming_off_behaves_exactly_like_the_legacy_engine(engine_state, monkeypatch):
+    """Degradation is contract: with STREAMING off, no partial work happens at all."""
+    monkeypatch.setattr(engine, "STREAMING", False)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+
+    def _boom(audio):
+        raise AssertionError("no transcription may run during capture when streaming is off")
+
+    monkeypatch.setattr(engine, "transcribe", _boom)
+
+    eng = engine.Engine()
+    for _ in range(3):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+
+    assert eng._speaking is True
+    assert not engine.PARTIAL_FILE.exists()
+
+
+def test_pill_reads_the_partial_file(engine_state):
+    """Writer + reader in the same commit: a draft nobody renders is dead code.
+
+    The pill needs AppKit, so it cannot be imported headless — this locks the
+    contract at source level, the same way the levels.bin magic number is.
+    """
+    pill = (Path(engine.__file__).parent / "vibevoice.py").read_text()
+    assert "partial.txt" in pill, "the pill must read the live draft"
+    # And it must prefer the draft only while the utterance is open, otherwise
+    # it would keep showing a stale draft after the real text landed.
+    assert "_read_partial" in pill
+
+
+def test_partial_worker_failure_does_not_break_capture(engine_state, monkeypatch):
+    """A partial is a bonus, never a dependency — it may fail silently."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+
+    def _boom(audio):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(engine, "transcribe", _boom)
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    _drain_partials(eng)
+
+    assert eng._speaking is True
+    assert engine.STATE_FILE.read_text() == "recording"
+    assert not engine.PARTIAL_FILE.exists()

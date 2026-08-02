@@ -75,6 +75,11 @@ device for vibe coding: **think out loud, ship.**
 
 - **Matrix pixel waveform** — a live, retro-green RMS waveform rendered in the notch.
 - **Immediate onset** — the pill reacts the instant you start speaking; silence makes it disappear.
+- **Live text while you talk** — the words appear in the notch *as you speak them*,
+  not after you stop. The open utterance is re-decoded every 0.6 s and a word is shown
+  only once two successive passes agree on it (LocalAgreement-2), so the draft grows
+  steadily instead of flickering — and never un-says something you have already read.
+  `VIBEVOICE_STREAMING=0` restores the pure batch behaviour.
 - **Universal autosend (CGEvent)** — pastes into *any* frontmost app via synthetic
   keyboard events, no app-specific integration required.
 - **One-shot auto-Return daemon** — an optional `autosend.py` that presses Return

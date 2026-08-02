@@ -74,6 +74,7 @@ own `autosend` flag.
 | `~/.vibevoice/state` | text: `idle` \| `recording` \| `transcribing` | engine | pill |
 | `~/.vibevoice/levels.bin` | **exactly 60 × float32 little-endian**, RMS 0..1, written atomically (`tmp` + `os.replace`) | engine | pill |
 | `~/.vibevoice/raw.txt` | last transcription, plain text (the sentence only) | engine | pill |
+| `~/.vibevoice/partial.txt` | **live draft** of the utterance being spoken, plain text, written atomically (`tmp` + `os.replace`). **Presence = an utterance is in flight; content = the words confirmed so far** (may legitimately be empty). Absent = nothing live. | engine | pill |
 | `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py, pill | autosend.py, pill |
 | `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock) | external tools | autosend.py |
 | `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
@@ -213,6 +214,9 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_CLEANUP_MODEL` | `llama-3.1-8b-instant` | model id sent to the cleanup endpoint |
 | `VIBEVOICE_CLEANUP_TIMEOUT` | `2.5` | seconds before the cleanup call is abandoned (raw text pasted instead) |
 | `VIBEVOICE_CLEANUP_API_KEY` | *(unset)* | bearer key for the endpoint; falls back to `GROQ_API_KEY` |
+| `VIBEVOICE_STREAMING` | `1` | re-decode the **open** utterance while it is still being spoken and publish the stable prefix to `partial.txt`, so text exists before `SILENCE_SEC` expires. `0` restores the pure batch engine (no partial pass, no `partial.txt`) — locked by `test_streaming_off_behaves_exactly_like_the_legacy_engine` |
+| `VIBEVOICE_PARTIAL_INTERVAL` | `0.6` | minimum seconds between two streaming passes. Lower = fresher live text and more CPU; a pass that is still decoding when the next is due simply skips its turn. Headroom is real: a partial pass measured **~170 ms** on an M5 Max (whisper-turbo, MLX, 2–12 s buffers — the cost is flat because Whisper pads to its 30 s window anyway; measured 2026-08-02) |
+| `VIBEVOICE_SILENCE` | `1.5` | trailing silence that closes an utterance — the wait before the **paste**. Streaming removes this wait from the *visible* text, not from the paste. Lowering it (e.g. `0.8`) makes dictation land sooner but splits an utterance on any mid-sentence pause |
 
 ### Environment variables (pill)
 | Var | Default | Meaning |
@@ -245,6 +249,11 @@ still verified behaviorally. After any change, also exercise the path you touche
 - **Engine / VAD / transcription** → run `python3 engine.py`, speak a short phrase and a
   long monologue; confirm `~/.vibevoice/state` cycles `idle→recording→transcribing→idle`,
   `raw.txt` updates, and the long monologue is not truncated (invariant #4/#5).
+- **Streaming / live text** → `VIBEVOICE_AUTOSEND=0 python3 engine.py`, then in another
+  shell `while :; do printf '\r%-90s' "$(cat ~/.vibevoice/partial.txt 2>/dev/null)"; sleep 0.2; done`
+  and speak a long sentence **without stopping**. The draft must grow *while you talk*
+  and never un-say a word already shown; it disappears when the utterance finalizes and
+  `raw.txt` takes over. `VIBEVOICE_STREAMING=0` must produce no `partial.txt` at all.
 - **Paste / autosend** → focus a terminal *and* an Electron editor; confirm the text
   lands in both (invariant #6) and Return behaves as configured (section 4).
 - **Contract changes** → grep for every reader before editing a writer:
@@ -326,6 +335,7 @@ available and keep it green. Match the existing comment density — the code fav
 | If you're touching… | Go to |
 |---------------------|-------|
 | VAD thresholds, silence/duration tuning, transcription | `engine.py` → `Engine`, module constants |
+| Streaming / live text while speaking, hypothesis stabilization | `engine.py` → `LocalAgreement`, `Engine._partial_worker`, `write_partial`, `STREAMING` / `PARTIAL_INTERVAL` · reader: `vibevoice.py` → `_read_partial` |
 | Capture backend (voice processing / Apple AEC, sounddevice fallback) | `engine.py` → `_VoiceProcessingCapture`, `_SounddeviceCapture`, `_select_capture_backend`, `_ensure_avfoundation` |
 | Speech/non-speech decision (Silero VAD worker, RMS fallback, hysteresis) | `engine.py` → `SileroVad`, `_resolve_silero_model`, `_ensure_onnxruntime`, `SILERO_*` constants |
 | The paste mechanism / Electron compatibility | `engine.py` → `_press_key_cg`, `autosend` |

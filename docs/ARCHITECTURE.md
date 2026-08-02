@@ -144,6 +144,37 @@ sandbox, which is what makes paste land in Electron editors. If Quartz/PyObjC is
 it falls back to `osascript ... keystroke "v"`. Return (key 36) is pressed only when
 `VIBEVOICE_AUTOSEND_RETURN=1`, after `RETURN_DELAY`.
 
+### 2.5 Streaming: live text while the utterance is still open (F3)
+
+Batch transcription has a floor that no tuning removes: the first word cannot appear
+before `SILENCE_SEC` of trailing silence, because the utterance is not closed until
+then. F3 removes the floor by transcribing the **open** buffer as it grows.
+
+Every `PARTIAL_INTERVAL` (0.6 s) the audio callback snapshots the block **list**
+(references only — the `np.concatenate` happens on the worker, never on the audio
+thread) and hands it to a single-slot worker: `Semaphore(1)`, separate from the two
+final-transcription slots, so a partial can never starve a real one. If the previous
+pass is still decoding the turn is simply skipped.
+
+The worker re-decodes the whole open utterance, which means Whisper freely rewrites
+its own tail every pass. Raw partials would flicker, so they go through
+`LocalAgreement` (LocalAgreement-2, whisper-streaming): **a word is published only
+once two successive hypotheses agree on it.** Agreement compares words with
+punctuation stripped and case folded — Whisper re-punctuates as context grows, and
+comparing glyphs would find almost no agreement. The spelling published is the one
+from the pass that saw the word *first*: the draft the user is reading must not
+re-punctuate itself under their eyes. Nothing is ever retracted.
+
+The confirmed prefix goes to `partial.txt` (atomic write). A generation counter,
+bumped on every utterance open **and** close, makes an in-flight partial stale so it
+cannot publish a draft for an utterance that is already finished. `_finalize` clears
+the file; the pill only renders it while `state == "recording"`, which is the real
+guard against a late partial.
+
+Failure is contained by design: the pass is wrapped whole, and any error costs one
+pass of live text — never the sentence. `VIBEVOICE_STREAMING=0` removes the pass
+entirely and the engine is bit-identical to the pre-F3 one.
+
 ---
 
 ## 3. The pill (`vibevoice.py`)
