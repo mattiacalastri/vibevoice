@@ -63,6 +63,7 @@ def engine_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
     monkeypatch.setattr(engine, "DICT_FILE", tmp_path / "dictionary.txt")
     monkeypatch.setattr(engine, "CORRECTIONS_FILE", tmp_path / "corrections.jsonl")
+    monkeypatch.setattr(engine, "CORPUS_FILE", tmp_path / "corpus.jsonl")
     monkeypatch.setattr(engine, "PARTIAL_FILE", tmp_path / "partial.txt")
     monkeypatch.setattr(engine, "PARTIAL_TMP", tmp_path / "partial.tmp")
     monkeypatch.setattr(engine, "AUTOSEND_PAUSE_FLAG", tmp_path / "autosend_pause")
@@ -836,6 +837,58 @@ def test_agents_documents_barge_in_acceptance():
     # Measurable startup evidence that VP + Silero are the active paths.
     assert "VibeVoice: capture: voice-processing" in sec
     assert "VibeVoice: VAD: silero" in sec
+
+
+# ── The learning corpus: a system that forgets cannot learn ──────────────────
+# history.jsonl is capped at 20 lines because the pill shows it. That makes it a
+# UI convenience, not a record — mining it for vocabulary yields nothing but the
+# last five minutes. Learning needs a corpus, so the engine keeps one.
+
+def test_every_utterance_is_kept_in_the_corpus(engine_state, monkeypatch):
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto tentacoli")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    for _ in range(3):
+        engine.process_utterance(loud, t_end=None)
+
+    lines = engine.CORPUS_FILE.read_text().splitlines()
+    assert len(lines) == 3
+    import json
+    assert json.loads(lines[0])["text"] == "il polpo ha otto tentacoli"
+
+
+def test_the_corpus_outlives_the_history_cap(engine_state, monkeypatch):
+    """The whole point: history rolls at HISTORY_MAX, the corpus does not."""
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "una frase qualunque")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    for _ in range(engine.HISTORY_MAX + 5):
+        engine.process_utterance(loud, t_end=None)
+
+    assert len(engine.HISTORY_FILE.read_text().splitlines()) == engine.HISTORY_MAX
+    assert len(engine.CORPUS_FILE.read_text().splitlines()) == engine.HISTORY_MAX + 5
+
+
+def test_the_corpus_is_bounded_so_it_cannot_grow_without_end(engine_state, monkeypatch):
+    """Unbounded is not a plan either: a year of dictation must not fill the disk."""
+    monkeypatch.setattr(engine, "CORPUS_MAX", 10)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "frase")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    for _ in range(14):
+        engine.process_utterance(loud, t_end=None)
+
+    assert len(engine.CORPUS_FILE.read_text().splitlines()) == 10
+
+
+def test_phantoms_never_enter_the_corpus(engine_state, monkeypatch):
+    """Learning from a hallucination teaches the hallucination."""
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "Grazie a tutti.")
+    silence = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)
+
+    engine.process_utterance(silence, t_end=None)
+
+    assert not engine.CORPUS_FILE.exists() or engine.CORPUS_FILE.read_text().strip() == ""
 
 
 # ── Telemetry of the streaming path (you can't improve what you don't log) ───

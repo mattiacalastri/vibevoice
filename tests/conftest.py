@@ -34,7 +34,7 @@ import engine
 # to their own tmp_path; this list is the floor underneath them.
 _WRITABLE_STATE = (
     "STATE_FILE", "LEVELS_FILE", "LEVELS_TMP", "RAW_FILE", "HISTORY_FILE",
-    "METRICS_FILE", "CORRECTIONS_FILE", "DICT_FILE", "MUTED_FILE",
+    "METRICS_FILE", "CORRECTIONS_FILE", "DICT_FILE", "MUTED_FILE", "CORPUS_FILE",
     "PARTIAL_FILE", "PARTIAL_TMP", "AUTOSEND_PAUSE_FLAG",
 )
 

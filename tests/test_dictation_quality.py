@@ -22,6 +22,7 @@ def quality_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "DICT_FILE", tmp_path / "dictionary.txt")
     monkeypatch.setattr(engine, "RAW_FILE", tmp_path / "raw.txt")
     monkeypatch.setattr(engine, "HISTORY_FILE", tmp_path / "history.jsonl")
+    monkeypatch.setattr(engine, "CORPUS_FILE", tmp_path / "corpus.jsonl")
     monkeypatch.setattr(engine, "METRICS_FILE", tmp_path / "metrics.jsonl")
     monkeypatch.setattr(engine, "STATE_FILE", tmp_path / "state")
     monkeypatch.setattr(engine, "LEVELS_FILE", tmp_path / "levels.bin")

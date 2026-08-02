@@ -107,6 +107,7 @@ LEVELS_FILE = STATE_DIR / "levels.bin"  # 60 float32 LE, RMS 0..1
 LEVELS_TMP = STATE_DIR / "levels.tmp"   # staging for atomic replace
 RAW_FILE = STATE_DIR / "raw.txt"        # last transcription, plain text
 HISTORY_FILE = STATE_DIR / "history.jsonl"  # last 20 transcriptions, JSONL {"ts","text"}
+CORPUS_FILE = STATE_DIR / "corpus.jsonl"    # the learning corpus: every real utterance, JSONL {"ts","text"}
 MUTED_FILE = STATE_DIR / "muted"        # control file: presence = mic paused (pill writes, engine reads)
 DICT_FILE = STATE_DIR / "dictionary.txt"  # control file: personal terms, one per line (user/tools write, engine reads)
 METRICS_FILE = STATE_DIR / "metrics.jsonl"  # per-utterance latency telemetry, JSONL, capped
@@ -154,7 +155,12 @@ LEVELS_HZ = 20          # target write frequency for levels.bin (Hz) — must no
                         # smaller BLOCKSIZE buys are thrown away before the pill
                         # ever sees them
 
-HISTORY_MAX = 20        # max lines in history.jsonl
+HISTORY_MAX = 20        # max lines in history.jsonl — a UI window, not a record
+# The learning corpus. history.jsonl is capped because the pill DISPLAYS it, so
+# mining it for vocabulary sees only the last five minutes; a system that throws
+# its experience away cannot learn from it. Bounded all the same — a year of
+# dictation must not fill the disk. At ~120 chars an utterance this is a few MB.
+CORPUS_MAX = 20000
 
 DICT_MAX_TERMS = 64     # terms fed to Whisper's initial_prompt (its context window is ~224 tokens)
 METRICS_MAX = 500       # max lines in metrics.jsonl
@@ -303,6 +309,25 @@ def _append_history(text: str) -> None:
             pass
         lines.append(json.dumps({"ts": time.time(), "text": text}))
         HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+    except Exception:
+        pass
+
+
+def _append_corpus(text: str) -> None:
+    """Append a real utterance to the learning corpus. Never raises.
+
+    Only reached for text that survived the phantom and loop guards: learning
+    from a hallucination teaches the hallucination.
+    """
+    try:
+        import json
+        lines = []
+        try:
+            lines = CORPUS_FILE.read_text().splitlines()
+        except OSError:
+            pass
+        lines.append(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False))
+        CORPUS_FILE.write_text("\n".join(lines[-CORPUS_MAX:]) + "\n")
     except Exception:
         pass
 
@@ -767,6 +792,7 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None,
         cleanup_ms = (time.monotonic() - t1) * 1000.0
     write_raw(text)
     _append_history(text)
+    _append_corpus(text)
     entry = {
         "ts": time.time(),
         "audio_s": round(len(audio) / SAMPLE_RATE, 3),
