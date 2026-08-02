@@ -34,13 +34,25 @@ PILL_LEVELS_BYTES = 60 * 4
 
 @pytest.fixture
 def engine_state(tmp_path, monkeypatch):
-    """Redirect the engine's state files into a tmp dir.
+    """Redirect the engine's state files into a tmp dir, and disarm every path
+    that reaches OUT of the process.
 
     EVERY module-level file the engine can write must be listed here: a full-flow
     test reaches process_utterance, and a path left unredirected leaks into the
     live ~/.vibevoice/ (scar sess.9685: seven fake entries in the real
     metrics.jsonl, written by this very suite before METRICS_FILE was patched).
+
+    The same argument applies to the OUTBOUND switches, and it bites harder: a
+    file written in the wrong place is recoverable, synthetic keystrokes posted
+    into whatever app the user has in front of them are not. When the streaming
+    paste landed (2026-08-02) `AUTOSEND` and `STREAM_PASTE` both defaulted to on,
+    so the partial-pass tests typed "il polpo ha" into the user's screen and
+    overwrote their clipboard. Off here by default: a test that wants to observe
+    the paste turns it back on **and** replaces `type_text`/`autosend` with a
+    recorder (see the `typed` fixture).
     """
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+    monkeypatch.setattr(engine, "STREAM_PASTE", False)
     monkeypatch.setattr(engine, "LEVELS_FILE", tmp_path / "levels.bin")
     monkeypatch.setattr(engine, "LEVELS_TMP", tmp_path / "levels.tmp")
     monkeypatch.setattr(engine, "STATE_FILE", tmp_path / "state")
@@ -911,6 +923,19 @@ def _drain_partials(eng, timeout: float = 5.0) -> None:
     raise AssertionError("partial worker never finished")
 
 
+def _drain_finals(eng, timeout: float = 5.0) -> None:
+    """Wait for the final transcription AND its paste to have run their course."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with eng._paste_cv:
+            settled = eng._paste_next >= eng._seq_next
+        if settled and eng._busy._value == 2:
+            time.sleep(0.05)   # let the paste thread's last statement land
+            return
+        time.sleep(0.01)
+    raise AssertionError("final transcription/paste never settled")
+
+
 def test_engine_publishes_a_partial_while_still_speaking(engine_state, monkeypatch):
     """The whole point: text exists BEFORE the utterance is finalized."""
     monkeypatch.setattr(engine, "STREAMING", True)
@@ -990,6 +1015,150 @@ def test_streaming_off_behaves_exactly_like_the_legacy_engine(engine_state, monk
 
     assert eng._speaking is True
     assert not engine.PARTIAL_FILE.exists()
+
+
+# ── Streaming paste: typing the confirmed words while the sentence is open ────
+# The confirmed prefix never retracts — that is exactly what makes it safe to
+# type. What must never happen is typing the same words twice: the final paste
+# may only add the tail the stream never reached.
+
+def test_unstreamed_tail_is_the_whole_text_when_nothing_was_streamed():
+    assert engine.unstreamed_tail("", "il polpo ha otto") == "il polpo ha otto"
+
+
+def test_unstreamed_tail_is_empty_when_the_stream_already_said_everything():
+    assert engine.unstreamed_tail("il polpo ha otto", "il polpo ha otto") == ""
+
+
+def test_unstreamed_tail_returns_only_the_words_the_stream_never_reached():
+    assert engine.unstreamed_tail("il polpo ha", "il polpo ha otto tentacoli") == "otto tentacoli"
+
+
+def test_unstreamed_tail_aligns_across_punctuation_drift():
+    """The stream typed "autonomo"; the final says "autonomo," — same word, no repeat."""
+    assert engine.unstreamed_tail(
+        "pensa in modo autonomo", "Pensa in modo autonomo, mentre il"
+    ) == "mentre il"
+
+
+def test_unstreamed_tail_keeps_the_tail_when_the_final_diverges_mid_sentence():
+    """Losing the end of a sentence is worse than a couple of repeated words."""
+    assert engine.unstreamed_tail(
+        "il polpo ha molti", "il polpo ha otto tentacoli"
+    ) == "otto tentacoli"
+
+
+@pytest.fixture
+def typed(monkeypatch):
+    """Record what the engine types instead of hitting the real keyboard."""
+    calls: list[str] = []
+    monkeypatch.setattr(engine, "type_text", lambda text: calls.append(text))
+    monkeypatch.setattr(engine, "autosend", lambda text: calls.append(text))
+    return calls
+
+
+def test_stream_paste_types_the_confirmed_delta_while_still_speaking(engine_state, monkeypatch, typed):
+    """The whole point: words reach the app BEFORE the trailing silence expires."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert eng._speaking is True, "must have typed while the utterance was open"
+    assert "".join(typed) == "il polpo ha"
+
+
+def test_stream_paste_separates_successive_chunks_with_a_space(engine_state, monkeypatch, typed):
+    """Two deltas must not weld into "il polpoha"."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+
+    hypotheses = iter(["il polpo", "il polpo ha", "il polpo ha otto", "il polpo ha otto"])
+    monkeypatch.setattr(engine, "transcribe", lambda audio: next(hypotheses, "il polpo ha otto"))
+
+    eng = engine.Engine()
+    for _ in range(4):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert "".join(typed) == "il polpo ha otto"
+
+
+def test_final_paste_adds_only_the_tail_after_streaming(engine_state, monkeypatch, typed):
+    """No duplication: the stream said "il polpo", the final adds " ha otto"."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    assert "".join(typed) == "il polpo"
+
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    _drain_finals(eng)
+
+    assert "".join(typed) == "il polpo ha otto", "the tail only, never the whole sentence again"
+
+
+def test_engine_state_fixture_disarms_the_outbound_switches(engine_state):
+    """The argine itself: no test may reach the user's keyboard or clipboard by
+    default. If this fails, every other test in this file became dangerous."""
+    assert engine.AUTOSEND is False
+    assert engine.STREAM_PASTE is False
+
+
+def test_stream_paste_off_still_pastes_the_whole_sentence_once(engine_state, monkeypatch, typed):
+    """Degradation is contract: with streaming paste off the behaviour is the old one."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", False)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    _drain_partials(eng)
+    assert typed == [], "nothing may be typed mid-utterance when the feature is off"
+
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    _drain_finals(eng)
+    assert typed == ["il polpo ha otto"]
+
+
+def test_stream_paste_stands_down_while_a_previous_utterance_is_still_pasting(engine_state, monkeypatch, typed):
+    """Ordering beats latency: typing into the middle of a pending paste would
+    interleave two sentences. The stream skips its turn and the final paste
+    delivers the whole thing."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "seconda frase")
+
+    eng = engine.Engine()
+    # Simulate an earlier utterance whose paste has not had its turn yet.
+    with eng._paste_cv:
+        eng._seq_next = 1
+        eng._paste_next = 0
+
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert typed == [], "must not type over a pending paste"
 
 
 def test_pill_reads_the_partial_file(engine_state):

@@ -218,7 +218,8 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_CLEANUP_API_KEY` | *(unset)* | bearer key for the endpoint; falls back to `GROQ_API_KEY` |
 | `VIBEVOICE_STREAMING` | `1` | re-decode the **open** utterance while it is still being spoken and publish the stable prefix to `partial.txt`, so text exists before `SILENCE_SEC` expires. `0` restores the pure batch engine (no partial pass, no `partial.txt`) — locked by `test_streaming_off_behaves_exactly_like_the_legacy_engine` |
 | `VIBEVOICE_PARTIAL_INTERVAL` | `0.6` | minimum seconds between two streaming passes. Lower = fresher live text and more CPU; a pass that is still decoding when the next is due simply skips its turn. Headroom is real: a partial pass measured **~170 ms** on an M5 Max (whisper-turbo, MLX, 2–12 s buffers — the cost is flat because Whisper pads to its 30 s window anyway; measured 2026-08-02) |
-| `VIBEVOICE_SILENCE` | `1.5` | trailing silence that closes an utterance — the wait before the **paste**. Streaming removes this wait from the *visible* text, not from the paste. Lowering it (e.g. `0.8`) makes dictation land sooner but splits an utterance on any mid-sentence pause |
+| `VIBEVOICE_STREAM_PASTE` | `1` | type each confirmed chunk into the frontmost app **as it is confirmed** (via `type_text`, direct unicode keystrokes — no clipboard), instead of pasting the whole sentence after the trailing silence. The final paste then adds only `unstreamed_tail()`. Safe only because the confirmed prefix never retracts. `0` restores the single atomic paste |
+| `VIBEVOICE_SILENCE` | `1.5` | trailing silence that closes an utterance. With `VIBEVOICE_STREAM_PASTE=1` this no longer gates the text reaching the app — only the last unconfirmed word or two wait for it |
 
 ### Environment variables (pill)
 | Var | Default | Meaning |
@@ -414,3 +415,18 @@ in §3 — and update this section if you do.
    app. It's fine in practice but is the place to look for input latency or
    process churn; any optimization must keep the window-signature check (it's
    what prevents a Return firing into a window you switched away from).
+6. **The streaming paste can repeat a word, and cannot take one back.** It types
+   the confirmed prefix as it is confirmed; the final transcription, which has
+   full context, may disagree with a word already on screen. `unstreamed_tail()`
+   aligns the two punctuation-insensitively and pastes from the divergence point
+   on — so a genuine divergence repeats a word or two rather than losing the end
+   of the sentence. Correcting with backspaces was rejected: synthetic deletes in
+   terminals and autocomplete fields destroy more than they fix. Punctuation the
+   stream typed can also differ from the final text (the stream saw less
+   context). `VIBEVOICE_STREAM_PASTE=0` trades the latency back for exactness.
+7. **Tests must disarm the outbound switches, not just redirect the files.** The
+   `engine_state` fixture forces `AUTOSEND` and `STREAM_PASTE` off. When the
+   streaming paste landed, both defaulted to on and the partial-pass tests typed
+   into the user's frontmost app and overwrote their clipboard. A file written in
+   the wrong place is recoverable; posted keystrokes are not. Locked by
+   `test_engine_state_fixture_disarms_the_outbound_switches`.

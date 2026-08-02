@@ -52,7 +52,21 @@ def _redirect_state(tmp: Path) -> None:
         ("PARTIAL_FILE", "partial.txt"), ("PARTIAL_TMP", "partial.tmp"),
     ):
         setattr(engine, attr, tmp / name)
-    engine.AUTOSEND = False  # never paste into the user's frontmost app
+
+
+# What the engine WOULD have typed, with timestamps. The real keyboard is never
+# touched: synthetic keystrokes posted into whatever app the user has in front
+# of them are not recoverable, unlike a file written in the wrong place.
+TYPED: list[tuple[float, str]] = []
+_T0 = [0.0]
+
+
+def _arm_paste_recorder() -> None:
+    """Enable the paste paths but redirect them into TYPED."""
+    engine.AUTOSEND = True
+    engine.STREAM_PASTE = True
+    engine.type_text = lambda text: TYPED.append((time.monotonic() - _T0[0], text)) or True
+    engine.autosend = lambda text: TYPED.append((time.monotonic() - _T0[0], text))
 
 
 def _speech_wav(dest: Path) -> Path:
@@ -158,6 +172,8 @@ def main() -> int:
             time.sleep(0.05)
 
     t_start = time.monotonic()
+    _T0[0] = t_start
+    _arm_paste_recorder()
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
 
@@ -200,8 +216,32 @@ def main() -> int:
     )
     check("nessuna parola già mostrata è stata ritirata", monotonic)
     check("il testo finale è arrivato", bool(final.strip()))
+
+    # ── Streaming paste: what actually reached the app, and when ─────────────
+    print("\n▸ cosa è stato digitato nell'app (t = secondi dall'inizio del parlato)")
+    for t, chunk in TYPED:
+        print(f"   {t:5.1f}s  {chunk!r}")
+    landed = "".join(chunk for _, chunk in TYPED)
+    keys_typed = [engine._agreement_key(w) for w in landed.split()]
+    keys_final = [engine._agreement_key(w) for w in final.split()]
+
+    first_typed_t = TYPED[0][0] if TYPED else None
+    check("qualcosa è stato digitato mentre parlavi ancora",
+          first_typed_t is not None and first_typed_t < speech_s,
+          f"primo carattere a {first_typed_t:.1f}s" if first_typed_t is not None else "nulla digitato")
+    check("nessuna parola digitata due volte, nessuna persa",
+          keys_typed == keys_final,
+          f"{len(keys_typed)} parole digitate vs {len(keys_final)} finali")
+    check("le parole non si sono saldate fra loro", "  " not in landed and landed == landed.strip())
+
+    if first_typed_t is not None:
+        # The old engine could not paste before SILENCE_SEC had elapsed after the
+        # last word — that is the number this whole feature exists to beat.
+        old_paste_t = speech_s + engine.SILENCE_SEC
+        print(f"\n▸ guadagno sull'incolla: primo testo nell'app a {first_typed_t:.1f}s "
+              f"contro {old_paste_t:.1f}s del motore batch → {old_paste_t - first_typed_t:.1f}s prima")
     if first_word_t is not None and raw_at:
-        print(f"\n▸ guadagno: bozza a {first_word_t:.1f}s vs testo finale a {raw_at[0]:.1f}s "
+        print(f"▸ guadagno sulla bozza: {first_word_t:.1f}s vs testo finale a {raw_at[0]:.1f}s "
               f"→ {raw_at[0] - first_word_t:.1f}s di anticipo")
 
     print(f"\n{'PASS' if ok else 'FAIL'}   (stato in {tmp})")

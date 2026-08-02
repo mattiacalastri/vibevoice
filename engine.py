@@ -163,6 +163,11 @@ SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing sile
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
 PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
+# Streaming paste: type each confirmed chunk into the frontmost app as it is
+# confirmed, instead of pasting the whole sentence after the trailing silence.
+# Safe only because the confirmed prefix never retracts. `0` restores the single
+# atomic paste at finalize.
+STREAM_PASTE = os.environ.get("VIBEVOICE_STREAM_PASTE", "1") == "1"
 MIN_DUR = 0.4           # discard utterances shorter than this (seconds)
 MAX_DUR = 15.0          # force finalize after this many seconds (short enough to keep each blob within the recognizer's comfort window + sustain rhythm on long dictation)
 PRE_ROLL_BLOCKS = 5     # blocks of audio kept before speech onset
@@ -618,6 +623,62 @@ def _press_key_cg(key_code: int, with_command: bool = False) -> bool:
         return True
     except Exception:
         return False
+
+
+_TYPE_CHUNK = 16   # CGEventKeyboardSetUnicodeString is unreliable past ~20 UTF-16 units
+
+
+def type_text(text: str) -> bool:
+    """Type `text` into the frontmost app as synthetic keystrokes.
+
+    Used by the streaming paste, which fires many times per sentence: going
+    through the clipboard would thrash the user's pasteboard a dozen times a
+    dictation (sharp edge #2 says we already overwrite it once — doing it 15
+    times is a different animal). `CGEventKeyboardSetUnicodeString` posts the
+    characters directly, at the same HID tap as the Cmd+V path, so it reaches
+    sandboxed Electron editors too. Returns False if Quartz is unavailable.
+    """
+    if not text:
+        return True
+    try:
+        from Quartz import (  # type: ignore
+            CGEventCreateKeyboardEvent,
+            CGEventKeyboardSetUnicodeString,
+            CGEventPost,
+            kCGHIDEventTap,
+        )
+        for off in range(0, len(text), _TYPE_CHUNK):
+            chunk = text[off:off + _TYPE_CHUNK]
+            for is_down in (True, False):
+                event = CGEventCreateKeyboardEvent(None, 0, is_down)
+                CGEventKeyboardSetUnicodeString(event, len(chunk), chunk)
+                CGEventPost(kCGHIDEventTap, event)
+                time.sleep(0.002)
+        return True
+    except Exception as err:
+        sys.stderr.write(f"VibeVoice: typing failed: {err}\n")
+        return False
+
+
+def unstreamed_tail(streamed: str, final: str) -> str:
+    """The part of `final` the streaming paste has NOT already typed.
+
+    Aligns on words, punctuation-insensitively: the stream typed "autonomo"
+    while the final says "autonomo," — the same word, and repeating it would be
+    worse than the missing comma. Where the two genuinely diverge we keep the
+    tail from the divergence point on: losing the end of a sentence is worse
+    than a couple of repeated words (see AGENTS.md §9).
+    """
+    if not streamed:
+        return final
+    streamed_words = streamed.split()
+    final_words = final.split()
+    aligned = 0
+    for a, b in zip(final_words, streamed_words):
+        if _agreement_key(a) != _agreement_key(b):
+            break
+        aligned += 1
+    return " ".join(final_words[aligned:])
 
 
 def autosend(text: str) -> None:
@@ -1141,6 +1202,7 @@ class Engine:
         self._partial_busy = threading.Semaphore(1)
         self._t_partial = 0.0                 # monotonic time of the last partial dispatch
         self._utt_gen = 0                     # bumped on every open/close: makes in-flight partials stale
+        self._streamed = ""                   # what the streaming paste has already typed for THIS utterance
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -1289,6 +1351,7 @@ class Engine:
                 write_levels(self._rms_history)
                 with self._agree_lock:
                     self._agree.reset()
+                    self._streamed = ""
                 clear_partial()
             elif do_finalize == "finalize":  # type: ignore[comparison-overlap]
                 self._finalize(now)
@@ -1338,11 +1401,25 @@ class Engine:
             with self._paste_cv:
                 seq = self._seq_next
                 self._seq_next += 1
+            # Snapshot what the stream already typed for THIS utterance: the next
+            # onset resets it, and the worker must not read the successor's state.
+            with self._agree_lock:
+                streamed = self._streamed
             threading.Thread(
-                target=self._transcribe_worker, args=(audio, now, seq), daemon=True
+                target=self._transcribe_worker, args=(audio, now, seq, streamed), daemon=True
             ).start()
         else:
             write_state("idle")
+
+    def _paste_queue_is_clear(self) -> bool:
+        """True when no earlier utterance is still waiting to paste.
+
+        Ordering beats latency: typing a live chunk into the middle of a pending
+        paste would interleave two sentences. When a predecessor is outstanding
+        the stream simply stands down and the final paste delivers the lot.
+        """
+        with self._paste_cv:
+            return self._paste_next >= self._seq_next
 
     def _partial_worker(self, blocks: list, gen: int) -> None:
         """Re-decode the still-open utterance and publish its stable prefix.
@@ -1359,11 +1436,22 @@ class Engine:
             text = transcribe(audio)
             if gen != self._utt_gen:
                 return
+            lead = ""
             with self._agree_lock:
-                self._agree.update(text)
+                delta = self._agree.update(text)
                 draft = self._agree.confirmed
-            if gen == self._utt_gen:
-                write_partial(draft)
+                # Claim the chunk under the same lock that produced it, so two
+                # passes can never type overlapping text.
+                if delta and STREAM_PASTE and AUTOSEND and self._paste_queue_is_clear():
+                    lead = " " if self._streamed else ""
+                    self._streamed = draft
+                else:
+                    delta = ""
+            if gen != self._utt_gen:
+                return
+            write_partial(draft)
+            if delta:
+                type_text(lead + delta)
         except Exception as err:
             sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
         finally:
@@ -1372,11 +1460,20 @@ class Engine:
     _PASTE_ORDER_TIMEOUT = 8.0  # a wedged predecessor must not dam the queue forever
 
     def _transcribe_worker(self, audio: np.ndarray, t_end: float = 0.0,
-                           seq: int | None = None) -> None:
-        """Transcribe, publish to raw.txt, and optionally autosend (in order)."""
+                           seq: int | None = None, streamed: str = "") -> None:
+        """Transcribe, publish to raw.txt, and optionally autosend (in order).
+
+        `streamed` is what the streaming paste already typed for this utterance:
+        only the remainder may be pasted, or the sentence would land twice.
+        """
         try:
             write_state("transcribing")
             text = process_utterance(audio, t_end=t_end or None)
+            if streamed:
+                # Only the remainder — and it must not weld onto the last word
+                # the stream already typed ("il polpo" + "ha" = "il polpoha").
+                tail = unstreamed_tail(streamed, text)
+                text = (" " + tail) if tail else ""
             if text and AUTOSEND:
                 # Paste off the worker thread (the busy slot frees promptly);
                 # the paste thread itself enforces utterance order.

@@ -80,6 +80,12 @@ device for vibe coding: **think out loud, ship.**
   only once two successive passes agree on it (LocalAgreement-2), so the draft grows
   steadily instead of flickering — and never un-says something you have already read.
   `VIBEVOICE_STREAMING=0` restores the pure batch behaviour.
+- **The text lands as you speak** — each confirmed chunk is typed straight into the
+  frontmost app (direct unicode keystrokes, your clipboard is left alone), so you are
+  not waiting on the silence at the end of the sentence. Measured on a 10.3 s sentence:
+  first characters in the app after **1.3 s** instead of 11.8 s. Only the last word or
+  two, the ones the stream never got to confirm, arrive with the final paste.
+  `VIBEVOICE_STREAM_PASTE=0` goes back to one atomic paste at the end.
 - **Universal autosend (CGEvent)** — pastes into *any* frontmost app via synthetic
   keyboard events, no app-specific integration required.
 - **One-shot auto-Return daemon** — an optional `autosend.py` that presses Return

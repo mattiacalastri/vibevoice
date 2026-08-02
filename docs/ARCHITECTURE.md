@@ -175,6 +175,37 @@ Failure is contained by design: the pass is wrapped whole, and any error costs o
 pass of live text — never the sentence. `VIBEVOICE_STREAMING=0` removes the pass
 entirely and the engine is bit-identical to the pre-F3 one.
 
+### 2.6 Streaming paste: the words land in the app as they are confirmed
+
+Streaming fixed the *visible* latency; the paste still waited for `SILENCE_SEC`.
+Measured on the author's live telemetry (32 utterances, 2026-08-02): `stt_ms`
+p50 = **185 ms**, so of the ~1.7 s between the last word and the paste, ~1.5 s
+was dead waiting.
+
+`STREAM_PASTE` types each confirmed delta the moment LocalAgreement commits it.
+This is only safe because the confirmed prefix never retracts — the stabilizer
+is the precondition, not a nicety. Three details make it survivable:
+
+- **Direct keystrokes, not the clipboard.** `type_text()` posts the characters
+  with `CGEventKeyboardSetUnicodeString` at the HID tap, in 16-character chunks.
+  Going through `pbcopy` a dozen times per sentence would shred the pasteboard.
+- **The chunk is claimed under the stabilizer's lock.** `update()` returns the
+  delta and `_streamed` is advanced in the same critical section, so two partial
+  passes can never type overlapping text.
+- **The stream stands down when an earlier utterance is still pasting**
+  (`_paste_queue_is_clear`). Interleaving two sentences is worse than a slow one;
+  in that case the final paste delivers the whole thing.
+
+At finalize, `unstreamed_tail(streamed, final)` aligns what was typed against the
+authoritative transcription — punctuation-insensitively, since the stream saw
+less context — and only the remainder is pasted, prefixed with a space so it
+cannot weld onto the last typed word. See sharp edge #6 for what happens when
+the two genuinely disagree.
+
+Baseline 2026-08-02, M5 Max, 10.3 s sentence: first characters in the app at
+**1.3 s**, against 11.8 s for the batch engine — 10.5 s earlier, 31 words typed
+against 31 in the final text (no duplication, no loss).
+
 ---
 
 ## 3. The pill (`vibevoice.py`)
