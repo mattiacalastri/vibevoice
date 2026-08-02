@@ -67,6 +67,12 @@ OPTIONS = {
         "CFBundleVersion": "1.0.0",
         "LSMinimumSystemVersion": "12.0",
         "LSUIElement": False,  # Dock ON by default; runtime policy follows config.json
+        # A double-clicked app must LISTEN when you open it. The engine autostart
+        # lives in an environment variable, which the LaunchAgent supplies and a
+        # double click does not — so the packaged app opened, drew its pill, and
+        # transcribed nothing until you found the 🎙 toggle in the menu. That is
+        # the difference between a project you configure and an app that works.
+        "LSEnvironment": {"VIBEVOICE_ENGINE_AUTOSTART": "1"},
         "NSMicrophoneUsageDescription": "VibeVoice transcribes your voice into text, locally on your Mac.",
         "NSAppleEventsUsageDescription": "VibeVoice uses AppleScript to detect the frontmost app and press Return after dictation.",
     },
