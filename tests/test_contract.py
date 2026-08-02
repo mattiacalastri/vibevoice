@@ -891,8 +891,7 @@ def test_refused_anchor_is_recorded_not_silently_swallowed(engine_state, monkeyp
 
     eng = engine.Engine()
     with eng._agree_lock:
-        eng._streamed = "una cosa completamente diversa"
-        eng._streamed_gen = 0
+        eng._record_streamed(0, "una cosa completamente diversa")
     eng._transcribe_worker(loud, 0.0, 0, 0)
 
     entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
@@ -913,6 +912,38 @@ def test_silence_that_transcribes_to_filler_is_dropped(engine_state, monkeypatch
 
     assert engine.process_utterance(silence, t_end=None) == ""
     assert not engine.RAW_FILE.exists(), "a phantom must not reach raw.txt"
+
+
+def test_whisper_repetition_loops_never_reach_the_app(engine_state, monkeypatch):
+    """Whisper degenerates into a repetition loop on non-speech audio. Captured
+    live 2026-08-02 while the user was chewing: the mic opened an utterance and
+    "trous" was typed 200 times into his editor, then "음" 110 times. The
+    phantom guard could not help — it only judges SHORT texts, and a loop is
+    long by definition.
+    """
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+    loud = np.full(engine.SAMPLE_RATE * 3, 0.3, dtype=np.float32)
+
+    for loop in (" ".join(["trous"] * 200),
+                 ", ".join(["음"] * 110),
+                 " ".join(["Sottotitoli e revisione a cura di QTSS"] * 6)):
+        monkeypatch.setattr(engine, "transcribe", lambda audio, t=loop: t)
+        assert engine.process_utterance(loud, t_end=None) == "", f"leaked: {loop[:40]}"
+
+
+def test_real_speech_that_repeats_a_word_is_not_mistaken_for_a_loop(engine_state, monkeypatch):
+    """Italian repeats words for emphasis and while thinking aloud. The guard
+    must key on degeneracy, not on repetition."""
+    monkeypatch.setattr(engine, "AUTOSEND", False)
+    loud = np.full(engine.SAMPLE_RATE * 3, 0.3, dtype=np.float32)
+    sentences = [
+        "no no no non è quello che intendevo, aspetta un attimo che ti spiego meglio",
+        "sì sì sì certo, allora dimmi pure come vuoi procedere con questa cosa",
+        "cioè cioè non lo so, non lo so bene, forse dovremmo riprovare domani",
+    ]
+    for text in sentences:
+        monkeypatch.setattr(engine, "transcribe", lambda audio, t=text: t)
+        assert engine.process_utterance(loud, t_end=None) == text, f"eaten: {text[:40]}"
 
 
 def test_quietly_spoken_short_words_survive_the_phantom_guard(engine_state, monkeypatch):
@@ -944,7 +975,9 @@ def test_dropped_phantoms_are_counted(engine_state, monkeypatch):
 def test_quiet_but_long_transcription_is_kept(engine_state, monkeypatch):
     """The guard keys on BOTH quiet audio and a short text: a real sentence
     recorded quietly must survive, or the guard becomes a censor."""
-    long_text = " ".join(["parola"] * 12)
+    # A real sentence, not a repeated token: a degenerate string would now be
+    # caught by the loop guard and this test would be measuring the wrong thing.
+    long_text = "questa è una frase intera detta piano ma perfettamente reale e comprensibile"
     monkeypatch.setattr(engine, "transcribe", lambda audio: long_text)
     silence = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)
 
@@ -1564,11 +1597,99 @@ def test_a_chunk_typed_while_the_sentence_closes_is_not_repeated(engine_state, m
     assert "".join(landed) == "il polpo ha otto", f"duplicated: {landed!r}"
 
 
+def test_muting_stops_a_partial_from_typing_afterwards(engine_state, monkeypatch, typed):
+    """🔇 is a pause, and the user expects it to take effect at once. The mute
+    branch dropped the in-flight utterance but did NOT bump the generation, so a
+    partial already on the wire passed its checks and typed into the frontmost
+    app after the mic was paused. It also left partial.txt claiming a live
+    utterance while state said idle. Found by review 2026-08-02.
+    """
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    gen_before = eng._utt_gen
+    _drain_partials(eng)
+
+    engine.MUTED_FILE.touch()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+
+    assert eng._utt_gen != gen_before, "muting must invalidate the open utterance"
+    assert not engine.PARTIAL_FILE.exists(), "a paused mic must not claim a live draft"
+    assert not engine.AUTOSEND_PAUSE_FLAG.exists(), "the Return daemon must be freed"
+
+
+def test_an_utterance_too_short_to_transcribe_still_frees_the_return_daemon(engine_state, monkeypatch, typed):
+    """The flag is raised before typing and released after the paste. An
+    utterance dropped for being under MIN_DUR never reaches a paste, so it left
+    the daemon held — and autosend then swallows the Return of the sentence the
+    user actually dictated, silently, for up to PAUSE_TTL_SECONDS."""
+    eng = engine.Engine()
+    engine.hold_autosend()
+    assert engine.AUTOSEND_PAUSE_FLAG.exists()
+
+    eng._t_start = time.monotonic()
+    eng._finalize(eng._t_start + engine.MIN_DUR / 2)   # too short: dropped
+
+    assert not engine.AUTOSEND_PAUSE_FLAG.exists()
+
+
 def test_engine_and_daemon_agree_on_the_pause_flag_path():
     """Two processes, one path, no imports between them — assert they still match."""
     daemon = (Path(engine.__file__).parent / "autosend.py").read_text()
     assert str(engine.AUTOSEND_PAUSE_FLAG) in daemon or \
         "/tmp/vibevoice_autosend_pause" in daemon
+
+
+def test_the_next_utterance_cannot_erase_the_previous_one_s_typed_record(engine_state):
+    """The duplication that plagued the live runtime all of 2026-08-02.
+
+    `_streamed` was a single slot, cleared at the next onset. But the closing
+    utterance's worker reads it AFTER finalize — and while it waits for an
+    in-flight partial, the user is still talking, so the next utterance opens
+    and wipes the slot. The worker then reads "", concludes the stream typed
+    nothing, and pastes the whole sentence a second time:
+
+        "…e nuota nel mare" + "il polpo ha otto tentacoli e nuota nel mare profondo"
+
+    MAX_DUR is the realistic trigger, not luck: at 15s an utterance is force-cut
+    WHILE speech continues, so a partial is plausibly still decoding and the next
+    block opens the successor 50ms later. 32 of the user's 145 utterances hit
+    that cut.
+    """
+    eng = engine.Engine()
+    closing_gen = 1
+    with eng._agree_lock:                      # utterance A typed something
+        eng._streamed = "il polpo ha otto tentacoli"
+        eng._streamed_gen = closing_gen
+        eng._record_streamed(closing_gen, eng._streamed)
+
+    # A closes; B opens before the worker gets to read A's record.
+    with eng._lock:
+        eng._utt_gen = 3
+    with eng._agree_lock:
+        eng._streamed = ""                     # B's onset reset
+        eng._streamed_gen = -1
+
+    assert eng._collect_streamed(closing_gen)["typed"] == "il polpo ha otto tentacoli"
+
+
+def test_a_collected_record_is_not_kept_forever(engine_state):
+    """The per-utterance records must not accumulate for the life of the process."""
+    eng = engine.Engine()
+    for gen in range(1, 60):
+        with eng._agree_lock:
+            eng._record_streamed(gen, f"frase {gen}")
+        # Collect only every other one: the records nobody ever collects (an
+        # utterance dropped as too short, or one whose slot was full) are
+        # exactly the ones that would accumulate.
+        if gen % 2:
+            eng._collect_streamed(gen)
+    assert len(eng._streamed_by_gen) <= 8
 
 
 def test_pill_reads_the_partial_file(engine_state):

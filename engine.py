@@ -654,6 +654,12 @@ class LocalAgreement:
         self._prev = []
 
 
+_STREAMED_KEEP = 8      # per-utterance records held before the oldest is dropped
+# One record per utterance: what the stream typed, when the first character
+# landed, how many passes ran, and the utterance's own onset. They are read
+# together after the utterance closes, so they must be stored together — see
+# Engine._collect_streamed.
+_EMPTY_UTT = {"typed": "", "first": 0.0, "partials": 0, "start": 0.0}
 PHANTOM_MAX_WORDS = 5   # above this a quiet blob is treated as real (quiet) speech
 # Well BELOW the RMS gate on purpose. The guard re-judges speech-vs-silence with
 # the crude threshold even when the neural VAD — more sensitive by design, which
@@ -661,6 +667,41 @@ PHANTOM_MAX_WORDS = 5   # above this a quiet blob is treated as real (quiet) spe
 # "sì" was transcribed correctly and then deleted with no trace (review
 # 2026-08-02). Only near-total silence should qualify.
 PHANTOM_RMS_FACTOR = 0.4
+
+
+LOOP_MIN_WORDS = 8       # below this, repetition is emphasis, not degeneracy
+LOOP_MAX_PERIOD = 10     # longest repeating unit we look for (words)
+LOOP_PERIODICITY = 0.8   # share of positions that must repeat to call it a loop
+
+
+def _is_loop(text: str) -> bool:
+    """True when the transcription is a Whisper repetition loop, not speech.
+
+    Whisper degenerates on non-speech audio and emits the same thing forever.
+    Captured live 2026-08-02 while the user was chewing: "trous" 200 times into
+    his editor, then "음" 110 times, and Italian audio regularly produces the
+    subtitle-credit loop ("Sottotitoli e revisione a cura di …").
+
+    `_is_phantom` cannot catch these — it only judges SHORT texts, and a loop is
+    long by construction.
+
+    Measured as periodicity rather than as a word count, because the repeating
+    unit may be a whole phrase, and a single-word loop is just the case where
+    the period is 1 (which also covers "음, 음, 음", punctuation-interleaved,
+    since the keys drop punctuation). Italian repeats words for emphasis — "no
+    no no non è quello che intendevo" — but only for a moment: the share of
+    repeating positions across the WHOLE text stays far below the threshold.
+    """
+    words = [_agreement_key(w) for w in text.split()]
+    words = [w for w in words if w]
+    if len(words) < LOOP_MIN_WORDS:
+        return False
+    for period in range(1, min(LOOP_MAX_PERIOD, len(words) // 3) + 1):
+        matches = sum(1 for i in range(period, len(words))
+                      if words[i] == words[i - period])
+        if matches / (len(words) - period) >= LOOP_PERIODICITY:
+            return True
+    return False
 
 
 def _is_phantom(audio: np.ndarray, text: str) -> bool:
@@ -703,7 +744,7 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None,
     t0 = time.monotonic()
     text = transcribe(audio)
     stt_ms = (time.monotonic() - t0) * 1000.0
-    if text and _is_phantom(audio, text):
+    if text and (_is_loop(text) or _is_phantom(audio, text)):
         # A silent deletion nobody can see is worse than the phantom it
         # prevents: leave a countable trace so a guard that starts eating real
         # speech shows up in the ledger instead of in the user's confusion.
@@ -713,6 +754,7 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None,
             "chars": 0,
             "stt_ms": round(stt_ms, 1),
             "phantom": True,
+            "loop": _is_loop(text),
             "dropped": text[:60],
         })
         return ""
@@ -1389,6 +1431,14 @@ class Engine:
         self._utt_gen = 0                     # bumped on every open/close: makes in-flight partials stale
         self._streamed = ""                   # what the streaming paste has already typed for THIS utterance
         self._streamed_gen = -1               # which utterance _streamed belongs to
+        # Per-utterance record of what was typed, keyed by generation. A single
+        # slot was not enough: the closing utterance's worker reads it AFTER
+        # finalize, and while it waits for an in-flight partial the user is
+        # still speaking, so the next onset wiped the slot and the whole
+        # sentence was pasted a second time (review 2026-08-02, reproduced with
+        # real threads in the MAX_DUR window — which 32 of 145 real utterances
+        # go through). Written on claim, popped on collection.
+        self._streamed_by_gen: dict[int, str] = {}
         self._t_first_typed = 0.0             # when the first character of THIS utterance reached the app
         self._partials = 0                    # streaming passes run for THIS utterance
 
@@ -1476,7 +1526,14 @@ class Engine:
                         self._speaking = False
                         self._t_silence = None
                         self._buf = []
+                        # A pause must take effect NOW. Without bumping the
+                        # generation a partial already on the wire passes its
+                        # checks and types into the frontmost app after the mic
+                        # was paused (review 2026-08-02).
+                        self._utt_gen += 1
                     write_state("idle")
+                    clear_partial()
+                    release_autosend()
                 return
             self._was_muted = False
 
@@ -1547,6 +1604,9 @@ class Engine:
                     self._streamed = ""
                     self._t_first_typed = 0.0
                     self._partials = 0
+                    # Seed this utterance's record with its own onset, so the
+                    # KPI cannot later borrow the successor's.
+                    self._utt_record(self._utt_gen)["start"] = self._t_start
                 clear_partial()
             elif do_finalize == "finalize":  # type: ignore[comparison-overlap]
                 self._finalize(now)
@@ -1555,11 +1615,16 @@ class Engine:
             # Streaming pass: one slot, non-blocking. If the previous pass is
             # still decoding we simply skip this turn — a partial is a bonus.
             if partial_blocks is not None and self._partial_busy.acquire(blocking=False):
-                threading.Thread(
-                    target=self._partial_worker,
-                    args=(partial_blocks, partial_gen),
-                    daemon=True,
-                ).start()
+                try:
+                    threading.Thread(
+                        target=self._partial_worker,
+                        args=(partial_blocks, partial_gen),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    # Losing this permit would kill live text for good AND make
+                    # every later _collect_streamed burn its full drain timeout.
+                    self._partial_busy.release()
         except Exception:
             # The audio callback must never raise.
             pass
@@ -1590,6 +1655,10 @@ class Engine:
         if dur < MIN_DUR:
             write_state("idle")
             write_levels(self._rms_history)
+            # This utterance will never reach a paste, so nothing downstream
+            # would ever lower the flag: autosend would then swallow the Return
+            # of the sentence the user actually dictated (review 2026-08-02).
+            release_autosend()
             return
 
         # Up to two transcriptions in flight; if both slots are busy, drop this utterance.
@@ -1602,11 +1671,41 @@ class Engine:
             # it here would race: a partial pass that has claimed its delta but
             # not yet typed it would be missed, and the final paste would type
             # the same words a second time (seen in the wild 2026-08-02).
-            threading.Thread(
-                target=self._transcribe_worker, args=(audio, now, seq, closing_gen), daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._transcribe_worker,
+                    args=(audio, now, seq, closing_gen), daemon=True,
+                ).start()
+            except Exception as err:
+                # The permit is released in the worker's finally — if the worker
+                # never starts, it is lost for the life of the process and
+                # invariant #4's concurrency is permanently halved.
+                self._busy.release()
+                self._advance_paste(seq)
+                sys.stderr.write(f"VibeVoice: could not start transcription: {err}\n")
         else:
             write_state("idle")
+            release_autosend()
+
+    def _utt_record(self, gen: int) -> dict:
+        """The record for `gen`, creating it if new, keeping the map bounded.
+
+        Caller must hold `_agree_lock`. Records are normally removed by
+        `_collect_streamed`; the cap covers the ones that never are — an
+        utterance dropped for being too short, or one whose transcription slot
+        was full.
+        """
+        record = self._streamed_by_gen.get(gen)
+        if record is None:
+            record = dict(_EMPTY_UTT)
+            self._streamed_by_gen[gen] = record
+            for stale in sorted(self._streamed_by_gen)[:-_STREAMED_KEEP]:
+                del self._streamed_by_gen[stale]
+        return record
+
+    def _record_streamed(self, gen: int, typed: str) -> None:
+        """Note what the stream has typed so far for `gen`. Holds `_agree_lock`."""
+        self._utt_record(gen)["typed"] = typed
 
     def _paste_queue_is_clear(self) -> bool:
         """True when no earlier utterance is still waiting to paste.
@@ -1633,8 +1732,13 @@ class Engine:
             text = transcribe(audio)
             if gen != self._utt_gen:
                 return
+            if _is_loop(text):
+                # A degenerate pass must not be typed, and must not poison the
+                # stabilizer either: skipping leaves the draft as it was.
+                return
             with self._agree_lock:
                 self._partials += 1
+                self._utt_record(gen)["partials"] += 1
                 self._agree.update(text)
                 draft = self._agree.confirmed
                 # Claim the chunk under the same lock that produced it, so two
@@ -1653,6 +1757,9 @@ class Engine:
                         to_type = lead + " ".join(typeable[len(already):])
                         self._streamed = " ".join(typeable)
                         self._streamed_gen = gen
+                        # Also file it under this utterance: the successor's
+                        # onset must not be able to erase it.
+                        self._record_streamed(gen, self._streamed)
             if gen != self._utt_gen:
                 return
             write_partial(draft)
@@ -1661,8 +1768,13 @@ class Engine:
                 # starts at the first keystroke, not after the last.
                 hold_autosend()
                 type_text(to_type)
-                if not self._t_first_typed:
-                    self._t_first_typed = time.monotonic()
+                now = time.monotonic()
+                with self._agree_lock:
+                    if not self._t_first_typed:
+                        self._t_first_typed = now
+                    record = self._utt_record(gen)
+                    if not record["first"]:
+                        record["first"] = now
         except Exception as err:
             sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
         finally:
@@ -1672,17 +1784,25 @@ class Engine:
 
     _PARTIAL_DRAIN_TIMEOUT = 5.0  # a wedged partial must not dam the final paste
 
-    def _collect_streamed(self, closing_gen: int) -> str:
-        """What the streaming paste typed for the utterance that just closed.
+    def _collect_streamed(self, closing_gen: int) -> dict:
+        """The record of the utterance that just closed: what was typed, and its
+        KPI fields. Removed from the map — one utterance, one collection.
 
         Waits for the single partial slot first: a pass that has claimed its
         delta but not yet typed it must be counted, or the final paste repeats
         those words. Runs on the transcription thread, never on the audio thread.
+
+        Typed text and KPI travel together because they spoil together: by the
+        time this runs the successor may be open, and reading `_t_start`,
+        `_partials` and `_t_first_typed` loose gave the CLOSED utterance the
+        successor's onset and its zeroed counters — `partials: 0`,
+        `t_first_ms: -1`, systematically in the back-to-back case, which is
+        exactly what the immediacy KPI measures (review 2026-08-02).
         """
         got = self._partial_busy.acquire(timeout=self._PARTIAL_DRAIN_TIMEOUT)
         try:
             with self._agree_lock:
-                return self._streamed if self._streamed_gen == closing_gen else ""
+                return self._streamed_by_gen.pop(closing_gen, dict(_EMPTY_UTT))
         finally:
             if got:
                 self._partial_busy.release()
@@ -1696,13 +1816,13 @@ class Engine:
         """
         try:
             write_state("transcribing")
-            streamed = self._collect_streamed(closing_gen)
-            t_start = self._t_start
+            record = self._collect_streamed(closing_gen)
+            streamed = record["typed"]
             kpi = {
                 "stream_words": len(streamed.split()),
-                "partials": self._partials,
-                "t_first_ms": (round((self._t_first_typed - t_start) * 1000.0, 1)
-                               if self._t_first_typed and t_start else -1),
+                "partials": record["partials"],
+                "t_first_ms": (round((record["first"] - record["start"]) * 1000.0, 1)
+                               if record["first"] and record["start"] else -1),
             }
             text = process_utterance(audio, t_end=t_end or None, extra=kpi)
             if streamed:
