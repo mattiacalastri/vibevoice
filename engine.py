@@ -547,16 +547,37 @@ def cleanup_text(text: str) -> str:
 # ── LocalAgreement-2: turning unstable hypotheses into stable text ───────────
 
 _AGREE_STRIP = re.compile(r"[^\w']+", re.UNICODE)
+# Whisper emits the typographic apostrophe for Italian elisions as readily as
+# the ASCII one, often flipping between passes. Treating them as different
+# characters broke agreement exactly at l', dell', quest', un' — the commonest
+# words in fluent Italian — so the live draft stalled where it should flow.
+_APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'", "＇": "'"})
 
 
 def _agreement_key(word: str) -> str:
-    """Comparison key for one word: no punctuation, case-folded.
+    """Comparison key for one word: one apostrophe, no punctuation, case-folded.
 
     Whisper re-punctuates and re-capitalizes its own output as the buffer grows
     ("Ciao mondo" → "ciao, mondo come stai"). Comparing glyphs would find almost
     no agreement; comparing words finds the real one.
     """
-    return _AGREE_STRIP.sub("", word).casefold()
+    return _AGREE_STRIP.sub("", word.translate(_APOSTROPHES)).casefold()
+
+
+def _locate(needle: list[str], haystack: list[str]) -> int | None:
+    """Index where `needle` sits inside `haystack`, comparing by word key.
+
+    Empty needle is at 0 by definition. Returns None when it is not there at
+    all — the caller must then refuse to guess a position.
+    """
+    if not needle:
+        return 0
+    keys = [_agreement_key(w) for w in haystack]
+    target = [_agreement_key(w) for w in needle]
+    for start in range(len(keys) - len(target) + 1):
+        if keys[start:start + len(target)] == target:
+            return start
+    return None
 
 
 class LocalAgreement:
@@ -590,21 +611,35 @@ class LocalAgreement:
         what the final text will say instead of freezing an artefact of truncation.
         """
         words = hypothesis.split()
-        agreed = 0
-        for fresh_word, prev_word in zip(words, self._prev):
-            if _agreement_key(fresh_word) != _agreement_key(prev_word):
-                break
-            agreed += 1
+        prev = self._prev
         self._prev = words
 
-        # Refresh the glyphs of what is already published (identity must still hold).
-        for i in range(min(len(words), len(self._committed))):
-            if _agreement_key(words[i]) == _agreement_key(self._committed[i]):
-                self._committed[i] = words[i]
-
-        if agreed <= len(self._committed):
+        # Where does what we already published sit in each hypothesis? Whisper
+        # re-decodes the whole buffer, so it can revise the START too — "ciao
+        # amico mio" became "oh ciao amico mio". Tracking the committed words by
+        # POSITION silently misaligned every later commit and published a
+        # duplicated word (review 2026-08-02). So we re-locate ourselves each
+        # pass instead of assuming we have not moved.
+        here = _locate(self._committed, words)
+        there = _locate(self._committed, prev)
+        if here is None or there is None:
+            # We can no longer find what we published. Publishing anything now
+            # would be a guess at a position — say nothing.
             return ""
-        fresh = words[len(self._committed):agreed]
+
+        n = len(self._committed)
+        # Refresh the glyphs of published words (identity holds by construction
+        # of _locate): more context means better punctuation.
+        self._committed = words[here:here + n]
+
+        # Agreement resumes AFTER the published part, in both hypotheses.
+        fresh: list[str] = []
+        for a, b in zip(words[here + n:], prev[there + n:]):
+            if _agreement_key(a) != _agreement_key(b):
+                break
+            fresh.append(a)
+        if not fresh:
+            return ""
         self._committed = self._committed + fresh
         return " ".join(fresh)
 
@@ -620,6 +655,12 @@ class LocalAgreement:
 
 
 PHANTOM_MAX_WORDS = 5   # above this a quiet blob is treated as real (quiet) speech
+# Well BELOW the RMS gate on purpose. The guard re-judges speech-vs-silence with
+# the crude threshold even when the neural VAD — more sensitive by design, which
+# is why it exists — is what opened the utterance. At the plain threshold a soft
+# "sì" was transcribed correctly and then deleted with no trace (review
+# 2026-08-02). Only near-total silence should qualify.
+PHANTOM_RMS_FACTOR = 0.4
 
 
 def _is_phantom(audio: np.ndarray, text: str) -> bool:
@@ -644,7 +685,7 @@ def _is_phantom(audio: np.ndarray, text: str) -> bool:
         n = max(1, audio.size // 160)         # ~10 ms blocks
         blocks = np.array_split(audio, n)
         rms = np.array([float(np.sqrt(np.mean(b.astype(np.float64) ** 2))) for b in blocks])
-        return bool(np.percentile(rms, 90) < VAD_THRESHOLD)
+        return bool(np.percentile(rms, 90) < VAD_THRESHOLD * PHANTOM_RMS_FACTOR)
     except Exception:
         return False
 
@@ -662,7 +703,20 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None,
     t0 = time.monotonic()
     text = transcribe(audio)
     stt_ms = (time.monotonic() - t0) * 1000.0
-    if not text or _is_phantom(audio, text):
+    if text and _is_phantom(audio, text):
+        # A silent deletion nobody can see is worse than the phantom it
+        # prevents: leave a countable trace so a guard that starts eating real
+        # speech shows up in the ledger instead of in the user's confusion.
+        _append_metrics({
+            "ts": time.time(),
+            "audio_s": round(len(audio) / SAMPLE_RATE, 3),
+            "chars": 0,
+            "stt_ms": round(stt_ms, 1),
+            "phantom": True,
+            "dropped": text[:60],
+        })
+        return ""
+    if not text:
         return ""
     cleanup_ms = None
     if CLEANUP_ENABLED:
@@ -797,11 +851,18 @@ def unstreamed_tail(streamed: str, final: str) -> str:
     # a match has, the more certain the junction.
     for size in range(min(_ANCHOR_LEN, len(typed)), 0, -1):
         anchor = typed[-size:]
-        # Search from the END: on a repeated phrase the latest occurrence is the
-        # one we just typed.
-        for start in range(len(keys) - size, -1, -1):
-            if keys[start:start + size] == anchor:
-                return " ".join(final_words[start + size:])
+        matches = [start for start in range(len(keys) - size + 1)
+                   if keys[start:start + size] == anchor]
+        if not matches:
+            continue
+        # Among equal matches, take the one nearest to where the stream actually
+        # stopped. Always taking the LAST one deleted whatever lay between two
+        # occurrences — and Italian repeats short phrases when thinking aloud
+        # ("non lo so, non lo so bene"), so the deletion was silent and common
+        # (review 2026-08-02).
+        expected = len(typed) - size
+        best = min(matches, key=lambda start: (abs(start - expected), start))
+        return " ".join(final_words[best + size:])
     return ""
 
 

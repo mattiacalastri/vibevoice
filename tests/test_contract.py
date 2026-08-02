@@ -915,6 +915,32 @@ def test_silence_that_transcribes_to_filler_is_dropped(engine_state, monkeypatch
     assert not engine.RAW_FILE.exists(), "a phantom must not reach raw.txt"
 
 
+def test_quietly_spoken_short_words_survive_the_phantom_guard(engine_state, monkeypatch):
+    """The guard re-litigates speech-vs-silence with the crude RMS threshold,
+    even when the neural VAD (which is more sensitive by design, and is why it
+    was added) is what opened this utterance. A soft "sì" just under the RMS
+    floor was deleted with no trace anywhere. The floor is now well below the
+    VAD threshold, so only true silence qualifies. Found by review 2026-08-02.
+    """
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "sì")
+    quiet = np.full(engine.SAMPLE_RATE, engine.VAD_THRESHOLD * 0.9, dtype=np.float32)
+
+    assert engine.process_utterance(quiet, t_end=None) == "sì"
+
+
+def test_dropped_phantoms_are_counted(engine_state, monkeypatch):
+    """A silent deletion nobody can see is worse than the phantom it prevents:
+    if the guard ever starts eating real speech, the ledger must show it."""
+    import json
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "Grazie a tutti.")
+    silence = np.zeros(engine.SAMPLE_RATE, dtype=np.float32)
+
+    assert engine.process_utterance(silence, t_end=None) == ""
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["phantom"] is True
+    assert entry["chars"] == 0, "nothing was published"
+
+
 def test_quiet_but_long_transcription_is_kept(engine_state, monkeypatch):
     """The guard keys on BOTH quiet audio and a short text: a real sentence
     recorded quietly must survive, or the guard becomes a censor."""
@@ -1001,6 +1027,41 @@ def test_local_agreement_keeps_confirmed_words_when_the_tail_shrinks():
     agree.update("il polpo ha otto")   # confirms all four
     agree.update("il polpo")           # a bad pass: shorter
     assert agree.confirmed == "il polpo ha otto"
+
+
+def test_local_agreement_survives_a_word_appearing_at_the_HEAD():
+    """Whisper re-decodes the whole buffer, so it can also revise the START:
+    "ciao amico mio" → "oh ciao amico mio". The committed words were tracked by
+    POSITION, so the shift silently misaligned every later commit and published
+    "ciao amico mio mio caro" — a duplicated word, typed straight to the screen.
+    Found by review 2026-08-02 and reproduced verbatim here.
+    """
+    agree = engine.LocalAgreement()
+    for hypothesis in ("ciao amico mio",
+                       "ciao amico mio caro",
+                       "oh ciao amico mio caro",
+                       "oh ciao amico mio caro davvero"):
+        agree.update(hypothesis)
+
+    assert "mio mio" not in agree.confirmed, f"duplicated word: {agree.confirmed!r}"
+    # Whatever it publishes must be an in-order subsequence of the real sentence:
+    # no invented words, no repeats, no reordering.
+    truth = "oh ciao amico mio caro davvero".split()
+    pos = -1
+    for word in agree.confirmed.split():
+        assert word in truth[pos + 1:], f"out of order or invented: {agree.confirmed!r}"
+        pos = truth.index(word, pos + 1)
+
+
+def test_local_agreement_publishes_nothing_when_it_cannot_locate_itself():
+    """If the new hypothesis no longer contains what was already published, the
+    only safe move is to publish nothing — never to guess a position."""
+    agree = engine.LocalAgreement()
+    agree.update("il polpo ha")
+    agree.update("il polpo ha")            # confirms three words
+    assert agree.update("tutt'altra frase") == ""
+    assert agree.update("tutt'altra frase") == ""
+    assert agree.confirmed == "il polpo ha"
 
 
 def test_local_agreement_reset_starts_a_new_utterance_clean():
@@ -1189,6 +1250,39 @@ def test_unstreamed_tail_anchors_on_the_END_of_what_was_typed():
     final = ("Ti dico i ragionamenti che fai, individua i pattern e risolvili "
              "tranquillamente con tutta la tua conoscenza")
     assert engine.unstreamed_tail(streamed, final) == "con tutta la tua conoscenza"
+
+
+def test_unstreamed_tail_picks_the_junction_where_the_stream_actually_stopped():
+    """Italian repeats short phrases when thinking aloud ("non lo so, non lo so
+    bene"). Anchoring on the LAST occurrence deleted everything in between —
+    silently, since nothing on screen looks broken. The junction belongs where
+    the stream actually reached, so among equal matches take the one nearest to
+    the number of words already typed. Found by review 2026-08-02.
+    """
+    assert engine.unstreamed_tail(
+        "non lo so", "non lo so, non lo so bene"
+    ) == "non lo so bene"
+    assert engine.unstreamed_tail(
+        "allora", "allora dimmi allora cosa vuoi"
+    ) == "dimmi allora cosa vuoi"
+
+
+def test_unstreamed_tail_still_anchors_late_when_the_stream_kept_pace():
+    """The nearest-junction rule must not undo the original fix: when the typed
+    text really does reach deep into the sentence, the late anchor is correct."""
+    assert engine.unstreamed_tail(
+        "il polpo ha otto tentacoli", "il polpo ha otto tentacoli e pensa"
+    ) == "e pensa"
+
+
+def test_agreement_key_treats_both_apostrophes_as_the_same_word():
+    """Whisper emits U+2019 for Italian elisions as often as U+0027. Treating
+    them as different words broke the agreement chain exactly at l', dell',
+    quest', un' — the most frequent words in fluent Italian, so the live draft
+    stalled precisely where it should flow."""
+    assert engine._agreement_key("l'inter") == engine._agreement_key("l’inter")
+    assert engine._agreement_key("dell'anno") == engine._agreement_key("dell’anno")
+    assert engine._agreement_key("quest'anno") == engine._agreement_key("quest’anno")
 
 
 def test_unstreamed_tail_refuses_to_paste_a_sentence_twice():
