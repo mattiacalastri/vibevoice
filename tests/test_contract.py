@@ -754,10 +754,21 @@ def autosend_mod(tmp_path, monkeypatch):
     return autosend
 
 
-def test_autosend_enabled_defaults_to_on(autosend_mod):
-    """Missing flag file self-heals to 'on' (first run is armed-readable)."""
-    assert autosend_mod.is_enabled() is True
-    assert autosend_mod.STATE_FILE.read_text() == "on"
+def test_autosend_defaults_to_disarmed(autosend_mod):
+    """A missing flag file means NOT armed.
+
+    It used to self-heal to "on", so a fresh state dir — a new machine, a new
+    install, a cleaned ~/.vibevoice — armed the daemon with no gesture at all.
+    TARGET_APPS is exactly the terminals (Terminal, iTerm2, Warp, Ghostty) and
+    editors, so the first 0.8s pause while typing a command sent Return and RAN
+    the half-written command line. The module's own docstring says "you arm it,
+    you dictate one message", and invariant #7 exists to stop a zombie ON.
+
+    The two errors do not cost the same: one extra click against a command
+    nobody typed. Reviewed and changed 2026-08-02.
+    """
+    assert autosend_mod.is_enabled() is False
+    assert not autosend_mod.STATE_FILE.exists(), "reading state must not create it"
 
 
 def test_autosend_set_enabled_roundtrip(autosend_mod):
@@ -1603,7 +1614,10 @@ def test_stream_paste_holds_the_auto_return_daemon(engine_state, monkeypatch, ty
         _drain_partials(eng)
 
     assert engine.AUTOSEND_PAUSE_FLAG.exists(), "the daemon must be held while streaming"
-    held_at = float(engine.AUTOSEND_PAUSE_FLAG.read_text().strip())
+    # Line 1 is the timestamp, line 2 names the holder — this test is a third
+    # reader of that contract, and parsing the whole file made it fail exactly
+    # the way the daemon's parser did before it was fixed.
+    held_at = float(engine.AUTOSEND_PAUSE_FLAG.read_text().splitlines()[0])
     assert abs(held_at - time.time()) < 5, "a stale timestamp would let the TTL expire mid-sentence"
 
 

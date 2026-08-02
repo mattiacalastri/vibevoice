@@ -95,8 +95,14 @@ def is_paused_by_flag() -> bool:
         if not PAUSE_FLAG.exists():
             return False
         try:
-            ts = float(PAUSE_FLAG.read_text().strip() or "0")
-        except (ValueError, OSError):
+            # Line 1 is the timestamp; an optional line 2 names the holder, so
+            # a release can tell its own hold from someone else's. Parsing the
+            # whole file would raise on the owner line, land in the except
+            # below with ts=0, and make a LIVE hold look expired — deleting it
+            # and firing the Return the hold existed to prevent.
+            first = PAUSE_FLAG.read_text().splitlines()[:1]
+            ts = float(first[0].strip()) if first and first[0].strip() else 0.0
+        except (ValueError, OSError, IndexError):
             ts = 0.0
         age = time.time() - ts
         if age > PAUSE_TTL_SECONDS:
@@ -130,11 +136,18 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def is_enabled() -> bool:
+    """True only when the flag says so. A missing file is NOT armed.
+
+    It used to self-heal to "on", so a fresh state dir armed the daemon with no
+    gesture — and TARGET_APPS is exactly the terminals and editors, so the first
+    0.8s pause while typing a command sent Return and ran the half-written
+    command line. Reading state must not create it either: an observer that
+    arms the thing it observes is not an observer.
+    """
     try:
         return STATE_FILE.read_text().strip() == "on"
-    except FileNotFoundError:
-        STATE_FILE.write_text("on")
-        return True
+    except OSError:
+        return False
 
 
 def set_enabled(v: bool) -> None:

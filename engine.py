@@ -272,6 +272,9 @@ def _patch_last_metrics(fields: dict) -> None:
         pass
 
 
+AUTOSEND_HOLD_OWNER = "vibevoice-engine"
+
+
 def hold_autosend() -> None:
     """Tell the standalone auto-Return daemon that a sentence is in progress.
 
@@ -282,13 +285,30 @@ def hold_autosend() -> None:
     anti-deadlock TTL can never expire while we are still typing.
     """
     try:
-        AUTOSEND_PAUSE_FLAG.write_text(str(time.time()))
+        # Line 1 stays the timestamp autosend.py parses; line 2 says who holds
+        # it. The flag is co-owned by contract (AGENTS §2) — an external tool
+        # raises it to protect a modal dialog — so an unconditional unlink here
+        # would revoke someone else's hold and let a Return into their dialog.
+        AUTOSEND_PAUSE_FLAG.write_text(f"{time.time()}\n{AUTOSEND_HOLD_OWNER}\n")
     except Exception:
         pass
 
 
 def release_autosend() -> None:
-    """The sentence is whole: let the Return fire."""
+    """The sentence is whole: let the Return fire — if the hold is ours.
+
+    A hold someone else raised is left exactly where it is. Its own TTL will
+    expire it; revoking another owner's protection is not ours to do.
+    """
+    try:
+        lines = AUTOSEND_PAUSE_FLAG.read_text().splitlines()
+    except OSError:
+        return
+    except Exception:
+        return
+    owner = lines[1].strip() if len(lines) > 1 else ""
+    if owner != AUTOSEND_HOLD_OWNER:
+        return
     try:
         AUTOSEND_PAUSE_FLAG.unlink()
     except FileNotFoundError:

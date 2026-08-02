@@ -44,8 +44,38 @@ def daemon(tmp_path, monkeypatch):
     return d, fired, disarmed
 
 
-def _hold(tmp_flag) -> None:
-    tmp_flag.write_text(str(time.time()))
+def _hold(tmp_flag, owner: str = "vibevoice-engine") -> None:
+    """Raise the flag the way the engine does: timestamp, then the owner."""
+    tmp_flag.write_text(f"{time.time()}\n{owner}\n")
+
+
+def test_an_owned_hold_is_still_read_as_a_hold(tmp_path, monkeypatch):
+    """The owner line must not make a live hold look expired.
+
+    Parsing the whole file raises on the owner name, which lands in the
+    fallback with ts=0 — the hold then looks an epoch old, gets deleted as
+    stale, and the Return it existed to prevent fires anyway.
+    """
+    monkeypatch.setattr(autosend, "PAUSE_FLAG", tmp_path / "pause")
+    _hold(tmp_path / "pause")
+
+    assert autosend.is_paused_by_flag() is True
+    assert (tmp_path / "pause").exists(), "a live hold must not be cleared"
+
+
+def test_the_engine_does_not_revoke_someone_else_s_hold(tmp_path, monkeypatch):
+    """The flag is co-owned by contract: an external tool raises it to protect a
+    modal dialog. An unconditional unlink would let a Return into that dialog."""
+    import engine
+    monkeypatch.setattr(engine, "AUTOSEND_PAUSE_FLAG", tmp_path / "pause")
+    _hold(tmp_path / "pause", owner="qualche-altro-strumento")
+
+    engine.release_autosend()
+    assert (tmp_path / "pause").exists(), "not ours to revoke"
+
+    _hold(tmp_path / "pause")            # our own hold
+    engine.release_autosend()
+    assert not (tmp_path / "pause").exists()
 
 
 def test_a_paused_daemon_waits_instead_of_dropping_the_return(daemon, tmp_path):
