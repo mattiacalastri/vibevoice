@@ -147,6 +147,40 @@ AUTOSEND_PATH = Path(os.path.abspath(__file__)).parent / "autosend.py"
 SHOW_PILL = False
 
 
+CONFIGURED_FLAG = STATE_DIR / "configured"  # presence = this state dir has been set up once
+
+
+def first_run_defaults(state_dir) -> list:
+    """Turn on what a brand-new install must show, exactly once.
+
+    `SHOW_PILL` is False, so the notch pill never appears: the visible surface
+    is the floating hardware widget, and its flag lives in the state dir. A
+    packaged app installed fresh therefore opened with nothing on screen but a
+    menu-bar icon and looked dead — which is what the first bundle did on
+    2026-08-02, while it was in fact transcribing.
+
+    The marker makes it a DEFAULT, not a policy: turn the widget off and it
+    stays off, here and across upgrades. Returns the paths created, so the
+    caller can log them; never raises.
+    """
+    from pathlib import Path
+    created = []
+    try:
+        state_dir = Path(state_dir)
+        marker = state_dir / "configured"
+        if marker.exists():
+            return created
+        state_dir.mkdir(parents=True, exist_ok=True)
+        widget = state_dir / "widget"
+        if not widget.exists():
+            widget.touch()
+            created.append(widget)
+        marker.touch()
+    except Exception:
+        pass
+    return created
+
+
 def _flag_on(path) -> bool:
     """True if a control flag file exists (defensive: never raises)."""
     try:
@@ -250,6 +284,10 @@ def _ensure_state_dir():
         STATE_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+    # A fresh install must show its one visible surface, or it looks dead while
+    # it is in fact transcribing.
+    for path in first_run_defaults(STATE_DIR):
+        sys.stderr.write(f"VibeVoice: first run — enabled {path.name}\n")
 
 
 def _pill_path(w, h, r):

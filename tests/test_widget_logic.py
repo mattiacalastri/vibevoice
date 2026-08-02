@@ -10,7 +10,44 @@ from __future__ import annotations
 
 import pytest
 
-from vibevoice import widget_bar_color, widget_bar_levels, widget_led, WIDGET_BARS
+from vibevoice import (
+    first_run_defaults,
+    widget_bar_color,
+    widget_bar_levels,
+    widget_led,
+    WIDGET_BARS,
+)
+
+
+# ── first run: an app you open must show you something ───────────────────────
+# SHOW_PILL is False, so the notch pill never appears; the visible surface is
+# the floating hardware widget, and its flag lives in the state dir. A packaged
+# app installed fresh therefore opened with nothing on screen but a menu-bar
+# icon and looked dead — which is exactly what happened to the first build,
+# 2026-08-02.
+
+def test_first_run_turns_the_visible_widget_on(tmp_path):
+    """A state dir nobody has configured yet gets the widget shown."""
+    created = first_run_defaults(tmp_path)
+
+    assert tmp_path / "widget" in created
+    assert (tmp_path / "widget").exists()
+
+
+def test_first_run_leaves_a_marker_so_it_happens_once(tmp_path):
+    first_run_defaults(tmp_path)
+    (tmp_path / "widget").unlink()          # the user turned it off
+
+    assert first_run_defaults(tmp_path) == []
+    assert not (tmp_path / "widget").exists(), "a deliberate choice must survive"
+
+
+def test_first_run_does_not_touch_an_existing_setup(tmp_path):
+    """An upgrade must not re-enable what the user had already decided."""
+    (tmp_path / "configured").touch()
+
+    assert first_run_defaults(tmp_path) == []
+    assert not (tmp_path / "widget").exists()
 
 
 # ── widget_bar_levels ─────────────────────────────────────────────────────────
