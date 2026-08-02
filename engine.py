@@ -659,7 +659,7 @@ _STREAMED_KEEP = 8      # per-utterance records held before the oldest is droppe
 # landed, how many passes ran, and the utterance's own onset. They are read
 # together after the utterance closes, so they must be stored together — see
 # Engine._collect_streamed.
-_EMPTY_UTT = {"typed": "", "first": 0.0, "partials": 0, "start": 0.0}
+_EMPTY_UTT = {"typed": "", "first": 0.0, "partials": 0, "start": 0.0, "stood_down": 0}
 PHANTOM_MAX_WORDS = 5   # above this a quiet blob is treated as real (quiet) speech
 # Well BELOW the RMS gate on purpose. The guard re-judges speech-vs-silence with
 # the crude threshold even when the neural VAD — more sensitive by design, which
@@ -1744,7 +1744,12 @@ class Engine:
                 # Claim the chunk under the same lock that produced it, so two
                 # passes can never type overlapping text.
                 to_type = ""
-                if STREAM_PASTE and AUTOSEND and self._paste_queue_is_clear():
+                if STREAM_PASTE and AUTOSEND and not self._paste_queue_is_clear():
+                    # Ordering beats latency, but a skipped turn is latency the
+                    # user feels — count it so the immediacy KPI can be explained
+                    # instead of guessed at.
+                    self._utt_record(gen)["stood_down"] += 1
+                elif STREAM_PASTE and AUTOSEND:
                     # One word of lag. The newest confirmed word still sits on
                     # the truncation edge, where Whisper puts a full stop that
                     # full context will drop ("lo sto testando." → "testando e").
@@ -1821,6 +1826,7 @@ class Engine:
             kpi = {
                 "stream_words": len(streamed.split()),
                 "partials": record["partials"],
+                "stood_down": record["stood_down"],
                 "t_first_ms": (round((record["first"] - record["start"]) * 1000.0, 1)
                                if record["first"] and record["start"] else -1),
             }

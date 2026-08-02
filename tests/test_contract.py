@@ -883,6 +883,39 @@ def test_utterance_records_how_much_the_stream_delivered(engine_state, monkeypat
     assert entry["t_first_ms"] >= 0, "when the first character reached the app"
 
 
+def test_a_stream_that_stands_down_is_counted(engine_state, monkeypatch, typed):
+    """When an earlier utterance is still waiting to paste, the stream skips its
+    turn — correct for ordering, but it is also the suspect for the immediacy
+    p90 (5.18s live against 1.4s synthetic). Back-to-back dictation with MAX_DUR
+    cuts is exactly when a predecessor is still pasting. Unmeasured, this is a
+    guess; counted, it is an answer.
+    """
+    import json
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
+
+    eng = engine.Engine()
+    with eng._paste_cv:                    # a predecessor still owes a paste
+        eng._seq_next = 1
+        eng._paste_next = 0
+
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    assert typed == [], "must not type over a pending paste"
+
+    with eng._paste_cv:                    # predecessor done
+        eng._paste_next = 1
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    _drain_finals(eng)
+
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["stood_down"] >= 1, "a skipped turn must be countable"
+
+
 def test_refused_anchor_is_recorded_not_silently_swallowed(engine_state, monkeypatch):
     """A tail we chose not to paste is words the user lost. It must be countable."""
     import json

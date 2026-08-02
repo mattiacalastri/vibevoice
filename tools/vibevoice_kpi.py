@@ -29,6 +29,7 @@ HISTORY = STATE / "history.jsonl"
 
 # Defaults mirrored from engine.py — only used to explain the tail wait.
 SILENCE_SEC = float(__import__("os").environ.get("VIBEVOICE_SILENCE", "1.5"))
+PARTIAL_INTERVAL = float(__import__("os").environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))
 
 
 def _load(path: Path) -> list[dict]:
@@ -87,6 +88,17 @@ def main() -> int:
     if first:
         print(f"│   p50 {_pct(first, .5)/1000:5.2f}s   p90 {_pct(first, .9)/1000:5.2f}s"
               f"   n={len(first)}")
+        # Why the slow ones are slow: the stream stands down whenever an earlier
+        # utterance still owes a paste, and back-to-back dictation with MAX_DUR
+        # cuts is exactly when that happens.
+        downs = [r.get("stood_down", 0) for r in rows if "stood_down" in r]
+        if downs:
+            blocked = len([d for d in downs if d])
+            print(f"│   turni saltati per un incolla ancora in coda: "
+                  f"{sum(downs)} su {len(downs)} utterance ({blocked} utterance toccate)")
+            if blocked:
+                print(f"│   → ognuno costa ~{PARTIAL_INTERVAL:.1f}s di attesa in più"
+                      f" sul primo carattere")
     else:
         print("│   (nessun dato: la digitazione progressiva era spenta)")
 
