@@ -23,20 +23,57 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 import engine
 
 
+# Every module-level path the engine can write. Per-test fixtures redirect these
+# to their own tmp_path; this list is the floor underneath them.
+_WRITABLE_STATE = (
+    "STATE_FILE", "LEVELS_FILE", "LEVELS_TMP", "RAW_FILE", "HISTORY_FILE",
+    "METRICS_FILE", "CORRECTIONS_FILE", "DICT_FILE", "MUTED_FILE",
+    "PARTIAL_FILE", "PARTIAL_TMP", "AUTOSEND_PAUSE_FLAG",
+)
+
+
 @pytest.fixture(autouse=True, scope="session")
-def _no_outbound_effects_during_tests():
-    """Replace the two functions that reach outside the process, for the whole run."""
+def _no_outbound_effects_during_tests(tmp_path_factory):
+    """Cut every path out of the process, for the whole run.
+
+    Two kinds of escape, one mechanism. The functions that reach the keyboard
+    and clipboard become no-ops, and every writable state path is moved into a
+    session-scoped temp dir.
+
+    The second half is not redundant with the per-test fixtures. Those use
+    function-scoped `monkeypatch`, which is undone at teardown — so a worker
+    that outlives its test finds the module attribute restored to the user's
+    real `~/.vibevoice/` and writes there. Measured 2026-08-02: 13 phantom rows
+    in the live metrics.jsonl, each 0.1 s of audio transcribed as "Grazie a
+    tutti.", which then skewed the KPI report enough to make a decode-latency
+    problem look three times worse than it is. Telemetry you cannot trust is
+    worse than none — it sends you optimising the wrong thing.
+    """
+    home = tmp_path_factory.mktemp("vibevoice_state")
     patch = pytest.MonkeyPatch()
     patch.setattr(engine, "autosend", lambda text: None)
     patch.setattr(engine, "type_text", lambda text: True)
+    for attr in _WRITABLE_STATE:
+        if hasattr(engine, attr):
+            patch.setattr(engine, attr, home / attr.lower())
     yield
     patch.undo()
+
+
+def test_no_writable_state_points_at_the_real_home():
+    """The floor itself. If this fails, the suite can corrupt the user's data."""
+    real = Path.home() / ".vibevoice"
+    for attr in _WRITABLE_STATE:
+        value = getattr(engine, attr, None)
+        if value is not None:
+            assert real not in Path(value).parents, f"{attr} still points at {value}"
 
 
 # How long to wait for a test's own threads before giving up and moving on.

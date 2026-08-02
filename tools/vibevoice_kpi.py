@@ -57,6 +57,17 @@ def _bar(fraction: float, width: int = 24) -> str:
 def main() -> int:
     only_today = "--today" in sys.argv
     rows = _load(METRICS)
+
+    # The engine never finalises an utterance shorter than MIN_DUR (0.4s), so a
+    # row below that was not dictated — it is a test buffer that leaked into the
+    # live ledger through a worker outliving its test (13 such rows on
+    # 2026-08-02, each 0.1s of audio transcribed as "Grazie a tutti."). They made
+    # slow decodes look three times more common than they are. The leak is
+    # closed in tests/conftest.py; this keeps the history readable regardless.
+    strays = len(rows)
+    rows = [r for r in rows if r.get("audio_s", 1.0) >= 0.4]
+    strays -= len(rows)
+
     if only_today:
         midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
         rows = [r for r in rows if r.get("ts", 0) >= midnight]
@@ -66,6 +77,8 @@ def main() -> int:
 
     print(f"╭─ VibeVoice · KPI su {len(rows)} utterance"
           f"{' (oggi)' if only_today else ''}")
+    if strays:
+        print(f"│   ({strays} righe sotto MIN_DUR ignorate — non sono dettature)")
 
     # ── 1. Immediacy: when did the first character reach the app? ────────────
     first = [r["t_first_ms"] for r in rows if r.get("t_first_ms", -1) >= 0]
