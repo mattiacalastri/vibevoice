@@ -290,12 +290,35 @@ class AutoSendDaemon:
             t.start()
             self._timer = t
 
-    def _fire(self, scheduled_app: str = "", scheduled_sig: str = "") -> None:
+    # The pause flag is transient: the engine raises it while the streaming
+    # paste is typing and lowers it once the sentence is whole. Retry across it
+    # instead of dropping the fire — but never past the flag's own TTL.
+    PAUSE_RETRY = 0.4
+    PAUSE_MAX_WAIT = PAUSE_TTL_SECONDS + 5.0
+
+    def _fire(self, scheduled_app: str = "", scheduled_sig: str = "",
+              waited: float = 0.0) -> None:
         if not is_enabled():
             return
-        # Suspend if an external tool raised the pause flag
+        # Paused mid-dictation. Returning here dropped the Return for the
+        # sentence the user actually dictated AND left the one-shot armed, so
+        # it later fired into whatever they typed by hand — silently, twice
+        # wrong (found by review 2026-08-02, reproduced). Wait it out instead.
         if is_paused_by_flag():
-            print("[autosend] skip — paused by flag", flush=True)
+            if waited >= self.PAUSE_MAX_WAIT:
+                print("[autosend] giving up — paused too long; disarming", flush=True)
+                set_enabled(False)   # never stay armed for a later keystroke
+                return
+            with self._lock:
+                if self._timer:
+                    self._timer.cancel()
+                t = threading.Timer(
+                    self.PAUSE_RETRY, self._fire,
+                    args=(scheduled_app, scheduled_sig, waited + self.PAUSE_RETRY),
+                )
+                t.daemon = True
+                t.start()
+                self._timer = t
             return
         # Verify window signature (lock at window level)
         current_sig = get_frontmost_signature()

@@ -60,6 +60,16 @@ def _no_outbound_effects_during_tests(tmp_path_factory):
     patch = pytest.MonkeyPatch()
     patch.setattr(engine, "autosend", lambda text: None)
     patch.setattr(engine, "type_text", lambda text: True)
+    # autosend.py presses Return through osascript. It is a third process with
+    # its own path to the keyboard, so it needs the same floor as the engine.
+    try:
+        import autosend as _autosend
+        patch.setattr(_autosend, "simulate_return",
+                      lambda *a, **k: type("R", (), {"returncode": 0, "stderr": ""})())
+        patch.setattr(_autosend, "afplay_sound", lambda *a, **k: None)
+        patch.setattr(_autosend, "PAUSE_FLAG", home / "autosend_pause_flag")
+    except Exception:
+        pass   # pynput absent: nothing of autosend can run anyway
     for attr in _WRITABLE_STATE:
         if hasattr(engine, attr):
             patch.setattr(engine, attr, home / attr.lower())
