@@ -1103,12 +1103,23 @@ def test_local_agreement_survives_a_word_appearing_at_the_HEAD():
     Found by review 2026-08-02 and reproduced verbatim here.
     """
     agree = engine.LocalAgreement()
+    published: list[str] = []
     for hypothesis in ("ciao amico mio",
                        "ciao amico mio caro",
                        "oh ciao amico mio caro",
                        "oh ciao amico mio caro davvero"):
-        agree.update(hypothesis)
+        published.extend(agree.update(hypothesis).split())
 
+    # THE invariant, and the one the streaming paste stands on: what is
+    # confirmed must be exactly what was published, word for word. Anything else
+    # means published words were silently rewritten underneath — and those words
+    # are already on the user's screen, where they cannot be taken back.
+    # (Asserting only the final string was not enough: a mutation that neuters
+    # _locate produces a plausible-looking final string while rewriting the
+    # published prefix. Caught by mutation testing 2026-08-02.)
+    assert [engine._agreement_key(w) for w in agree.confirmed.split()] == \
+        [engine._agreement_key(w) for w in published], \
+        f"published {published} but confirmed {agree.confirmed!r}"
     assert "mio mio" not in agree.confirmed, f"duplicated word: {agree.confirmed!r}"
     # Whatever it publishes must be an in-order subsequence of the real sentence:
     # no invented words, no repeats, no reordering.
