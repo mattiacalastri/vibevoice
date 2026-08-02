@@ -25,6 +25,8 @@ vibevoice/
 ├── com.vibevoice.autosend.plist  # LaunchAgent template for autosend   (replace __HOME__)
 ├── docs/
 │   └── ARCHITECTURE.md           # deep runtime reference (threads, VAD, geometry, constants)
+├── tools/
+│   └── smoke_streaming.py        # end-to-end smoke for the streaming path: real audio, real model, no mic
 ├── tests/
 │   ├── test_contract.py          # headless contract tests (no mic/GUI/model)
 │   └── test_app_bundle.py        # headless: builds VibeVoice.app, locks its shape
@@ -249,7 +251,16 @@ still verified behaviorally. After any change, also exercise the path you touche
 - **Engine / VAD / transcription** → run `python3 engine.py`, speak a short phrase and a
   long monologue; confirm `~/.vibevoice/state` cycles `idle→recording→transcribing→idle`,
   `raw.txt` updates, and the long monologue is not truncated (invariant #4/#5).
-- **Streaming / live text** → `VIBEVOICE_AUTOSEND=0 python3 engine.py`, then in another
+- **Streaming / live text (headless, no mic)** → `python3 tools/smoke_streaming.py`. It
+  replays a `say`-generated WAV through the capture seam **at wall-clock speed** with
+  the real model, redirects state to a throwaway dir, forces `AUTOSEND=0`, and prints
+  the draft timeline plus pass/fail criteria (a draft appeared, it appeared *before*
+  the speech ended, it grew, it never retracted, the final text landed). This is what
+  `pytest` cannot prove: the suite fakes `transcribe`, so it locks the wiring, not the
+  behaviour. It is a tool and not a pytest because it needs the model on disk and takes
+  ~30 s. Baseline 2026-08-02, M5 Max: first word at **1.5 s** on a 10.3 s sentence,
+  ~10.5 s ahead of the final text, one update every ~0.65 s.
+- **Streaming / live text (live mic)** → `VIBEVOICE_AUTOSEND=0 python3 engine.py`, then in another
   shell `while :; do printf '\r%-90s' "$(cat ~/.vibevoice/partial.txt 2>/dev/null)"; sleep 0.2; done`
   and speak a long sentence **without stopping**. The draft must grow *while you talk*
   and never un-say a word already shown; it disappears when the utterance finalizes and

@@ -516,24 +516,33 @@ class LocalAgreement:
     def update(self, hypothesis: str) -> str:
         """Feed a fresh full-utterance hypothesis; return the newly committed words.
 
-        Returns "" when this pass confirms nothing new. Never retracts: a shorter
-        or divergent hypothesis leaves already-published text alone (un-saying a
-        word the user has read is worse than a late one).
+        Returns "" when this pass confirms nothing new. The **word sequence** never
+        retracts: a shorter or divergent hypothesis leaves published words alone
+        (un-saying a word the user has read is worse than a late one).
+
+        The **spelling** of a published word, however, is refreshed from the newest
+        hypothesis while its identity holds. A word confirmed at the truncation edge
+        carries whatever punctuation closed that buffer — measured live 2026-08-02,
+        the draft read "modo autonomo. mentre il cervello" where the sentence really
+        had a comma. More context means better punctuation, so the draft converges on
+        what the final text will say instead of freezing an artefact of truncation.
         """
         words = hypothesis.split()
-        agreed: list[str] = []
+        agreed = 0
         for fresh_word, prev_word in zip(words, self._prev):
             if _agreement_key(fresh_word) != _agreement_key(prev_word):
                 break
-            # Keep the spelling from the pass that saw it FIRST: the draft the
-            # user is reading must not re-punctuate itself under their eyes.
-            # The final transcription (raw.txt) is the one with full context.
-            agreed.append(prev_word)
+            agreed += 1
         self._prev = words
 
-        if len(agreed) <= len(self._committed):
+        # Refresh the glyphs of what is already published (identity must still hold).
+        for i in range(min(len(words), len(self._committed))):
+            if _agreement_key(words[i]) == _agreement_key(self._committed[i]):
+                self._committed[i] = words[i]
+
+        if agreed <= len(self._committed):
             return ""
-        fresh = agreed[len(self._committed):]
+        fresh = words[len(self._committed):agreed]
         self._committed = self._committed + fresh
         return " ".join(fresh)
 

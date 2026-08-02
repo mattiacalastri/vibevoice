@@ -830,7 +830,30 @@ def test_local_agreement_matches_across_punctuation_and_case_drift():
     """Whisper re-punctuates as context grows; agreement is on words, not glyphs."""
     agree = engine.LocalAgreement()
     agree.update("Ciao mondo")
-    assert agree.update("ciao, mondo come stai") == "Ciao mondo"
+    assert agree.update("ciao, mondo come stai") == "ciao, mondo"
+
+
+def test_local_agreement_repunctuates_confirmed_words_as_context_grows():
+    """A word confirmed at the truncation edge carries a full stop that is wrong
+    mid-sentence ("autonomo." → "autonomo,"). Measured live on 2026-08-02: the
+    draft read "modo autonomo. mentre il cervello". The word order is what must
+    never change; the glyphs must converge on what the final text will say.
+    """
+    agree = engine.LocalAgreement()
+    agree.update("pensa in modo autonomo.")
+    agree.update("pensa in modo autonomo. mentre")      # confirms four words
+    agree.update("pensa in modo autonomo, mentre il")   # full context: it was a comma
+    assert agree.confirmed == "pensa in modo autonomo, mentre"
+
+
+def test_local_agreement_keeps_confirmed_words_when_the_tail_shrinks():
+    """Re-rendering from the newest hypothesis must not lose confirmed words if
+    that hypothesis comes back shorter than what is already published."""
+    agree = engine.LocalAgreement()
+    agree.update("il polpo ha otto")
+    agree.update("il polpo ha otto")   # confirms all four
+    agree.update("il polpo")           # a bad pass: shorter
+    assert agree.confirmed == "il polpo ha otto"
 
 
 def test_local_agreement_reset_starts_a_new_utterance_clean():
