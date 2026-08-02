@@ -26,7 +26,8 @@ vibevoice/
 ├── docs/
 │   └── ARCHITECTURE.md           # deep runtime reference (threads, VAD, geometry, constants)
 ├── tools/
-│   └── smoke_streaming.py        # end-to-end smoke for the streaming path: real audio, real model, no mic
+│   ├── smoke_streaming.py        # end-to-end smoke for the streaming path: real audio, real model, no mic
+│   └── vibevoice_kpi.py          # KPI report: immediacy, coverage, tail wait, junction fidelity
 ├── tests/
 │   ├── conftest.py               # session net: autosend/type_text are no-ops for the whole run
 │   ├── test_contract.py          # headless contract tests (no mic/GUI/model)
@@ -358,6 +359,7 @@ available and keep it green. Match the existing comment density — the code fav
 | Auto-Return timing, target-app gating, one-shot logic | `autosend.py` → `AutoSendDaemon` |
 | Personal dictionary, LLM cleanup pass, latency telemetry | `engine.py` → `load_dictionary`, `cleanup_text`, `process_utterance`, `CLEANUP_*` constants |
 | Correcting the last dictation / growing the dictionary | `tools/vibevoice_correct.py` · report: `tools/vibevoice_metrics.py` |
+| Deciding what to optimise next (immediacy, coverage, tail wait, lost tails) | `tools/vibevoice_kpi.py` — reads the per-utterance ledger; `metrics.jsonl` now carries `t_first_ms` / `stream_words` / `tail_words` / `final_words` / `anchor` / `partials` alongside `stt_ms` |
 | Deeper data-flow / threading model | `docs/ARCHITECTURE.md` |
 | `.app` bundle layout, Info.plist identity, mic/AppleEvents usage strings | `build_app.sh` (locked by `tests/test_app_bundle.py`) |
 

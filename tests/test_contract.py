@@ -838,6 +838,68 @@ def test_agents_documents_barge_in_acceptance():
     assert "VibeVoice: VAD: silero" in sec
 
 
+# ── Telemetry of the streaming path (you can't improve what you don't log) ───
+# metrics.jsonl measured the OLD architecture: how long the final decode took.
+# It says nothing about what now governs the experience — when the first
+# character reached the app, how much of the sentence the stream delivered, and
+# whether the tail alignment found its anchor or gave up.
+
+def test_process_utterance_merges_extra_telemetry(engine_state, monkeypatch):
+    """The engine knows the streaming numbers; process_utterance writes the line."""
+    import json
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    engine.process_utterance(loud, t_end=None, extra={"stream_words": 3, "anchor": "ok"})
+
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["stream_words"] == 3
+    assert entry["anchor"] == "ok"
+    assert "stt_ms" in entry, "the extra fields must not displace the existing ones"
+
+
+def test_utterance_records_how_much_the_stream_delivered(engine_state, monkeypatch, typed):
+    """The KPI that decides whether the tail latency still matters: if the
+    stream delivers most of the sentence, the wait at the end is a detail."""
+    import json
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto tentacoli")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    _drain_finals(eng)
+
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["stream_words"] == 4, "four words typed, 'tentacoli' held on the edge"
+    assert entry["tail_words"] == 1, "only the held-back word came with the final paste"
+    assert entry["anchor"] == "ok"
+    assert entry["partials"] >= 2
+    assert entry["t_first_ms"] >= 0, "when the first character reached the app"
+
+
+def test_refused_anchor_is_recorded_not_silently_swallowed(engine_state, monkeypatch):
+    """A tail we chose not to paste is words the user lost. It must be countable."""
+    import json
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "tutt'altra frase")
+    loud = np.full(engine.SAMPLE_RATE, 0.4, dtype=np.float32)
+
+    eng = engine.Engine()
+    with eng._agree_lock:
+        eng._streamed = "una cosa completamente diversa"
+        eng._streamed_gen = 0
+    eng._transcribe_worker(loud, 0.0, 0, 0)
+
+    entry = json.loads(engine.METRICS_FILE.read_text().splitlines()[-1])
+    assert entry["anchor"] == "none"
+    assert entry["tail_words"] == 0
+
+
 # ── Hallucination guard: no audio, no words ──────────────────────────────────
 # Whisper does not return "" on silence — it returns its training-set filler.
 # Found in the user's own history.jsonl (2026-08-02 11:47:12): an utterance

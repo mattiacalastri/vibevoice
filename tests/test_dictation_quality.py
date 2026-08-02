@@ -177,7 +177,9 @@ def test_pastes_stay_in_utterance_order_even_when_second_finishes_first(
     monkeypatch.setattr(engine, "AUTOSEND", True)
     monkeypatch.setattr(engine, "autosend", lambda text: pasted.append(text))
 
-    def fake_process(audio, t_end=None):
+    # Signature must mirror the real process_utterance, `extra` included:
+    # a double that drifts from it stops testing the thing it stands for.
+    def fake_process(audio, t_end=None, extra=None):
         _t.sleep(0.30 if len(audio) > 100 else 0.02)  # first slow, second fast
         return "prima frase" if len(audio) > 100 else "seconda frase"
 
@@ -211,7 +213,7 @@ def test_empty_transcription_does_not_dam_the_paste_queue(quality_state, monkeyp
     monkeypatch.setattr(engine, "autosend", lambda text: pasted.append(text))
     monkeypatch.setattr(
         engine, "process_utterance",
-        lambda audio, t_end=None: "" if len(audio) > 100 else "dopo il vuoto",
+        lambda audio, t_end=None, extra=None: "" if len(audio) > 100 else "dopo il vuoto",
     )
 
     eng._busy.acquire(blocking=False)

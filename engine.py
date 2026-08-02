@@ -245,6 +245,27 @@ def clear_partial() -> None:
         pass
 
 
+def _patch_last_metrics(fields: dict) -> None:
+    """Merge `fields` into the newest metrics line.
+
+    Some numbers are only known after `process_utterance` has already written
+    its line — the tail is computed against the authoritative text. Rewriting
+    the last line keeps one row per utterance instead of two half-rows that
+    every reader would then have to join.
+    """
+    try:
+        import json
+        lines = METRICS_FILE.read_text().splitlines()
+        if not lines:
+            return
+        entry = json.loads(lines[-1])
+        entry.update(fields)
+        lines[-1] = json.dumps(entry)
+        METRICS_FILE.write_text("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def hold_autosend() -> None:
     """Tell the standalone auto-Return daemon that a sentence is in progress.
 
@@ -628,7 +649,8 @@ def _is_phantom(audio: np.ndarray, text: str) -> bool:
         return False
 
 
-def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
+def process_utterance(audio: np.ndarray, t_end: float | None = None,
+                      extra: dict | None = None) -> str:
     """Transcribe one finalized utterance and publish text + telemetry.
 
     The measured pipeline (STT now; the LLM cleanup pass hooks in here) —
@@ -659,6 +681,9 @@ def process_utterance(audio: np.ndarray, t_end: float | None = None) -> str:
         entry["cleanup_ms"] = round(cleanup_ms, 1)
     if t_end is not None:
         entry["total_ms"] = round((time.monotonic() - t_end) * 1000.0, 1)
+    if extra:
+        # The engine owns the streaming numbers; this function owns the ledger.
+        entry.update(extra)
     _append_metrics(entry)
     return text
 
@@ -1303,6 +1328,8 @@ class Engine:
         self._utt_gen = 0                     # bumped on every open/close: makes in-flight partials stale
         self._streamed = ""                   # what the streaming paste has already typed for THIS utterance
         self._streamed_gen = -1               # which utterance _streamed belongs to
+        self._t_first_typed = 0.0             # when the first character of THIS utterance reached the app
+        self._partials = 0                    # streaming passes run for THIS utterance
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -1457,6 +1484,8 @@ class Engine:
                 with self._agree_lock:
                     self._agree.reset()
                     self._streamed = ""
+                    self._t_first_typed = 0.0
+                    self._partials = 0
                 clear_partial()
             elif do_finalize == "finalize":  # type: ignore[comparison-overlap]
                 self._finalize(now)
@@ -1544,6 +1573,7 @@ class Engine:
             if gen != self._utt_gen:
                 return
             with self._agree_lock:
+                self._partials += 1
                 self._agree.update(text)
                 draft = self._agree.confirmed
                 # Claim the chunk under the same lock that produced it, so two
@@ -1570,6 +1600,8 @@ class Engine:
                 # starts at the first keystroke, not after the last.
                 hold_autosend()
                 type_text(to_type)
+                if not self._t_first_typed:
+                    self._t_first_typed = time.monotonic()
         except Exception as err:
             sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
         finally:
@@ -1604,11 +1636,26 @@ class Engine:
         try:
             write_state("transcribing")
             streamed = self._collect_streamed(closing_gen)
-            text = process_utterance(audio, t_end=t_end or None)
+            t_start = self._t_start
+            kpi = {
+                "stream_words": len(streamed.split()),
+                "partials": self._partials,
+                "t_first_ms": (round((self._t_first_typed - t_start) * 1000.0, 1)
+                               if self._t_first_typed and t_start else -1),
+            }
+            text = process_utterance(audio, t_end=t_end or None, extra=kpi)
             if streamed:
                 # Only the remainder — and it must not weld onto the last word
                 # the stream already typed ("il polpo" + "ha" = "il polpoha").
                 tail = unstreamed_tail(streamed, text)
+                if text:
+                    # A refused anchor is words the user simply lost: count it.
+                    # (Only when a metrics line exists — a phantom writes none.)
+                    _patch_last_metrics({
+                        "anchor": "ok" if tail else "none",
+                        "tail_words": len(tail.split()),
+                        "final_words": len(text.split()),
+                    })
                 text = (" " + tail) if tail else ""
             if text and AUTOSEND:
                 # Paste off the worker thread (the busy slot frees promptly);
