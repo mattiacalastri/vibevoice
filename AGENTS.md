@@ -27,7 +27,8 @@ vibevoice/
 │   └── ARCHITECTURE.md           # deep runtime reference (threads, VAD, geometry, constants)
 ├── tools/
 │   ├── smoke_streaming.py        # end-to-end smoke for the streaming path: real audio, real model, no mic
-│   └── vibevoice_kpi.py          # KPI report: immediacy, coverage, tail wait, junction fidelity
+│   ├── vibevoice_kpi.py          # KPI report: immediacy, coverage, tail wait, junction fidelity
+│   └── verify_mutations.py       # removes each cure and checks its test screams
 ├── tests/
 │   ├── conftest.py               # session net: autosend/type_text are no-ops for the whole run
 │   ├── test_contract.py          # headless contract tests (no mic/GUI/model)
@@ -270,6 +271,14 @@ still verified behaviorally. After any change, also exercise the path you touche
   `raw.txt` takes over. `VIBEVOICE_STREAMING=0` must produce no `partial.txt` at all.
 - **Paste / autosend** → focus a terminal *and* an Electron editor; confirm the text
   lands in both (invariant #6) and Return behaves as configured (section 4).
+- **Is the suite real?** → `python3 tools/verify_mutations.py`. A green suite says
+  the code passes its tests; it does not say the tests would notice if the code
+  stopped working. This removes each fix from a throwaway copy and runs the test
+  that claims to guard it — the test must fail. It earned its keep on 2026-08-02
+  by finding a guard that passed with its own defect reinstated, hiding among 190
+  green tests. **Add an entry whenever you fix a defect that could come back**; a
+  stale entry (anchor no longer found) is itself reported, because it means that
+  scar stopped being checked.
 - **Contract changes** → grep for every reader before editing a writer:
   `grep -rn "levels.bin\|raw.txt\|\.vibevoice/state" .`
 - **Degradation paths are contract, not best-effort** → the no-`onnxruntime` and
