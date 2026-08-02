@@ -113,6 +113,8 @@ METRICS_FILE = STATE_DIR / "metrics.jsonl"  # per-utterance latency telemetry, J
 CORRECTIONS_FILE = STATE_DIR / "corrections.jsonl"  # control file: user corrections (tools write, engine reads)
 PARTIAL_FILE = STATE_DIR / "partial.txt"  # live draft while speaking; absent = nothing in flight
 PARTIAL_TMP = STATE_DIR / "partial.tmp"   # staging for atomic replace
+# autosend.py's pause hook (that daemon owns the semantics; we only raise/lower it).
+AUTOSEND_PAUSE_FLAG = Path("/tmp/vibevoice_autosend_pause")
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -228,6 +230,31 @@ def clear_partial() -> None:
     """Remove the live draft. Absence of the file IS the 'nothing in flight' signal."""
     try:
         PARTIAL_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def hold_autosend() -> None:
+    """Tell the standalone auto-Return daemon that a sentence is in progress.
+
+    `autosend.py` fires Return after 0.8s of typing silence. The streaming paste
+    types in bursts ~PARTIAL_INTERVAL apart — close enough that one slow pass
+    would read as "the user stopped" and send the message mid-sentence. Raising
+    the flag on every chunk also refreshes its timestamp, so the daemon's 60s
+    anti-deadlock TTL can never expire while we are still typing.
+    """
+    try:
+        AUTOSEND_PAUSE_FLAG.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def release_autosend() -> None:
+    """The sentence is whole: let the Return fire."""
+    try:
+        AUTOSEND_PAUSE_FLAG.unlink()
     except FileNotFoundError:
         pass
     except Exception:
@@ -645,12 +672,21 @@ def type_text(text: str) -> bool:
             CGEventCreateKeyboardEvent,
             CGEventKeyboardSetUnicodeString,
             CGEventPost,
+            CGEventSetFlags,
             kCGHIDEventTap,
         )
         for off in range(0, len(text), _TYPE_CHUNK):
             chunk = text[off:off + _TYPE_CHUNK]
             for is_down in (True, False):
                 event = CGEventCreateKeyboardEvent(None, 0, is_down)
+                # Virtual keycode 0 is the letter A. Electron-based editors read
+                # the KEYCODE, not the unicode payload, when a modifier is set —
+                # and a synthesized event inherits the current flag state. Left
+                # alone, a stray Command turns every chunk into Cmd+A: measured
+                # in the wild 2026-08-02, the whole editor went blue mid-sentence
+                # and the next chunk would have replaced the selection. Clearing
+                # the flags is what keeps this a keystroke instead of a shortcut.
+                CGEventSetFlags(event, 0)
                 CGEventKeyboardSetUnicodeString(event, len(chunk), chunk)
                 CGEventPost(kCGHIDEventTap, event)
                 time.sleep(0.002)
@@ -1203,6 +1239,7 @@ class Engine:
         self._t_partial = 0.0                 # monotonic time of the last partial dispatch
         self._utt_gen = 0                     # bumped on every open/close: makes in-flight partials stale
         self._streamed = ""                   # what the streaming paste has already typed for THIS utterance
+        self._streamed_gen = -1               # which utterance _streamed belongs to
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -1383,6 +1420,7 @@ class Engine:
             self._speaking = False
             self._t_silence = None
             self._buf = []
+            closing_gen = self._utt_gen
             self._utt_gen += 1  # partials still decoding are stale from here on
 
         # The draft has served its purpose: raw.txt is about to become the
@@ -1401,12 +1439,13 @@ class Engine:
             with self._paste_cv:
                 seq = self._seq_next
                 self._seq_next += 1
-            # Snapshot what the stream already typed for THIS utterance: the next
-            # onset resets it, and the worker must not read the successor's state.
-            with self._agree_lock:
-                streamed = self._streamed
+            # The worker reads what the stream typed for THIS utterance — by
+            # generation, and only after any in-flight chunk has landed. Reading
+            # it here would race: a partial pass that has claimed its delta but
+            # not yet typed it would be missed, and the final paste would type
+            # the same words a second time (seen in the wild 2026-08-02).
             threading.Thread(
-                target=self._transcribe_worker, args=(audio, now, seq, streamed), daemon=True
+                target=self._transcribe_worker, args=(audio, now, seq, closing_gen), daemon=True
             ).start()
         else:
             write_state("idle")
@@ -1443,14 +1482,18 @@ class Engine:
                 # Claim the chunk under the same lock that produced it, so two
                 # passes can never type overlapping text.
                 if delta and STREAM_PASTE and AUTOSEND and self._paste_queue_is_clear():
-                    lead = " " if self._streamed else ""
+                    lead = " " if (self._streamed and self._streamed_gen == gen) else ""
                     self._streamed = draft
+                    self._streamed_gen = gen
                 else:
                     delta = ""
             if gen != self._utt_gen:
                 return
             write_partial(draft)
             if delta:
+                # Hold the Return daemon BEFORE typing: the gap it measures
+                # starts at the first keystroke, not after the last.
+                hold_autosend()
                 type_text(lead + delta)
         except Exception as err:
             sys.stderr.write(f"VibeVoice: partial pass failed (live text skipped): {err}\n")
@@ -1459,15 +1502,33 @@ class Engine:
 
     _PASTE_ORDER_TIMEOUT = 8.0  # a wedged predecessor must not dam the queue forever
 
+    _PARTIAL_DRAIN_TIMEOUT = 5.0  # a wedged partial must not dam the final paste
+
+    def _collect_streamed(self, closing_gen: int) -> str:
+        """What the streaming paste typed for the utterance that just closed.
+
+        Waits for the single partial slot first: a pass that has claimed its
+        delta but not yet typed it must be counted, or the final paste repeats
+        those words. Runs on the transcription thread, never on the audio thread.
+        """
+        got = self._partial_busy.acquire(timeout=self._PARTIAL_DRAIN_TIMEOUT)
+        try:
+            with self._agree_lock:
+                return self._streamed if self._streamed_gen == closing_gen else ""
+        finally:
+            if got:
+                self._partial_busy.release()
+
     def _transcribe_worker(self, audio: np.ndarray, t_end: float = 0.0,
-                           seq: int | None = None, streamed: str = "") -> None:
+                           seq: int | None = None, closing_gen: int = -1) -> None:
         """Transcribe, publish to raw.txt, and optionally autosend (in order).
 
-        `streamed` is what the streaming paste already typed for this utterance:
-        only the remainder may be pasted, or the sentence would land twice.
+        Only the part the streaming paste never typed may be pasted, or the
+        sentence would land twice.
         """
         try:
             write_state("transcribing")
+            streamed = self._collect_streamed(closing_gen)
             text = process_utterance(audio, t_end=t_end or None)
             if streamed:
                 # Only the remainder — and it must not weld onto the last word
@@ -1481,8 +1542,11 @@ class Engine:
                     target=self._paste_in_order, args=(seq, text), daemon=True
                 ).start()
             else:
-                # No paste for this utterance — its turn must pass anyway.
+                # No paste for this utterance — its turn must pass anyway, and
+                # the Return daemon must be freed even when the stream said it all.
                 self._advance_paste(seq)
+                if not self._speaking:
+                    release_autosend()
         finally:
             write_state("idle")
             write_levels(self._rms_history)
@@ -1500,6 +1564,10 @@ class Engine:
             autosend(text)
         finally:
             self._advance_paste(seq)
+            # The sentence is whole — let the Return daemon fire again, unless a
+            # new utterance has already started typing.
+            if not self._speaking:
+                release_autosend()
 
     def _advance_paste(self, seq) -> None:
         if seq is None:

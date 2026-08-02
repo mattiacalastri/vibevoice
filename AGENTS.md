@@ -78,7 +78,7 @@ own `autosend` flag.
 | `~/.vibevoice/raw.txt` | last transcription, plain text (the sentence only) | engine | pill |
 | `~/.vibevoice/partial.txt` | **live draft** of the utterance being spoken, plain text, written atomically (`tmp` + `os.replace`). **Presence = an utterance is in flight; content = the words confirmed so far** (may legitimately be empty). Absent = nothing live. | engine | pill |
 | `~/.vibevoice/autosend` | text: `on` \| `off` (armed state) | autosend.py, pill | autosend.py, pill |
-| `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock) | external tools | autosend.py |
+| `/tmp/vibevoice_autosend_pause` | unix timestamp; suspends autosend for `PAUSE_TTL_SECONDS` (60s, anti-deadlock). **The engine raises it on every streamed chunk and clears it once the sentence is whole** (`hold_autosend` / `release_autosend`): the daemon fires Return after 0.8s of typing silence, and the streaming paste types in bursts ~`PARTIAL_INTERVAL` apart — without the hold, one slow pass sends the message mid-sentence | external tools, engine | autosend.py |
 | `~/.vibevoice/muted` | presence = mic paused: engine stays alive but ignores audio (a pause, not a kill) | pill | engine (`is_muted()`) |
 | `~/.vibevoice/dictionary.txt` | personal terms, one per line, `#` comments — biases Whisper via `initial_prompt` (max `DICT_MAX_TERMS`) | user, external tools | engine (`load_dictionary()`) |
 | `~/.vibevoice/metrics.jsonl` | per-utterance latency telemetry (`stt_ms`, `total_ms`, …), JSONL capped at `METRICS_MAX` | engine | `tools/vibevoice_metrics.py` (p50/p90/p99 report) |

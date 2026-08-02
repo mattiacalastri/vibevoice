@@ -14,6 +14,7 @@ Run:  pytest -q
 from __future__ import annotations
 
 import struct
+import threading
 import time
 import wave
 from collections import deque
@@ -64,6 +65,7 @@ def engine_state(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "CORRECTIONS_FILE", tmp_path / "corrections.jsonl")
     monkeypatch.setattr(engine, "PARTIAL_FILE", tmp_path / "partial.txt")
     monkeypatch.setattr(engine, "PARTIAL_TMP", tmp_path / "partial.tmp")
+    monkeypatch.setattr(engine, "AUTOSEND_PAUSE_FLAG", tmp_path / "autosend_pause")
     return tmp_path
 
 
@@ -1159,6 +1161,121 @@ def test_stream_paste_stands_down_while_a_previous_utterance_is_still_pasting(en
         _drain_partials(eng)
 
     assert typed == [], "must not type over a pending paste"
+
+
+# ── Streaming paste vs the standalone auto-Return daemon ─────────────────────
+# autosend.py fires Return after AUTO_SEND_DELAY (0.8s) of typing silence. The
+# streaming paste types in bursts ~0.65s apart — close enough that one slow pass
+# would send the message mid-sentence. The engine therefore holds the daemon's
+# pause flag while it is streaming and releases it once the sentence is whole.
+
+def test_stream_paste_holds_the_auto_return_daemon(engine_state, monkeypatch, typed):
+    """A pause between two typed chunks must not be read as 'the user stopped'."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert engine.AUTOSEND_PAUSE_FLAG.exists(), "the daemon must be held while streaming"
+    held_at = float(engine.AUTOSEND_PAUSE_FLAG.read_text().strip())
+    assert abs(held_at - time.time()) < 5, "a stale timestamp would let the TTL expire mid-sentence"
+
+
+def test_finished_sentence_releases_the_auto_return_daemon(engine_state, monkeypatch, typed):
+    """Once the sentence is whole the Return must be allowed to fire."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    assert engine.AUTOSEND_PAUSE_FLAG.exists()
+
+    eng._finalize(eng._t_start + engine.MIN_DUR + 0.1)
+    _drain_finals(eng)
+
+    assert not engine.AUTOSEND_PAUSE_FLAG.exists(), "the daemon must be freed after the paste"
+
+
+def test_no_hold_when_the_streaming_paste_is_off(engine_state, monkeypatch, typed):
+    """Nothing is typed mid-sentence, so nothing needs holding — leave the flag alone."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", False)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(2):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert not engine.AUTOSEND_PAUSE_FLAG.exists()
+
+
+def test_a_chunk_typed_while_the_sentence_closes_is_not_repeated(engine_state, monkeypatch):
+    """The race seen in the wild (2026-08-02): a partial pass had claimed its
+    chunk and was still typing when the utterance finalized, so the final paste
+    computed its tail from a stale `streamed` and typed the chunk a second time.
+    The user's screen read "...funzionando bene. parola.Anche la trascrizione".
+
+    Here `type_text` blocks mid-flight while the utterance is finalized, exactly
+    reproducing that window.
+    """
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "STREAM_PASTE", True)
+    monkeypatch.setattr(engine, "AUTOSEND", True)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo")
+
+    typing_started = threading.Event()
+    may_finish_typing = threading.Event()
+    landed: list[str] = []
+
+    def slow_type(text: str) -> bool:
+        landed.append(text)
+        typing_started.set()
+        may_finish_typing.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(engine, "type_text", slow_type)
+    monkeypatch.setattr(engine, "autosend", lambda text: landed.append(text))
+
+    eng = engine.Engine()
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    # Second pass confirms "il polpo" and starts typing it — then blocks.
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    assert typing_started.wait(timeout=5), "the partial pass never reached type_text"
+
+    # The sentence closes while that chunk is still on the wire.
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha otto")
+    closer = threading.Thread(
+        target=eng._finalize, args=(eng._t_start + engine.MIN_DUR + 0.1,), daemon=True
+    )
+    closer.start()
+    time.sleep(0.2)
+    may_finish_typing.set()
+    closer.join(timeout=5)
+    _drain_finals(eng)
+
+    assert "".join(landed) == "il polpo ha otto", f"duplicated: {landed!r}"
+
+
+def test_engine_and_daemon_agree_on_the_pause_flag_path():
+    """Two processes, one path, no imports between them — assert they still match."""
+    daemon = (Path(engine.__file__).parent / "autosend.py").read_text()
+    assert str(engine.AUTOSEND_PAUSE_FLAG) in daemon or \
+        "/tmp/vibevoice_autosend_pause" in daemon
 
 
 def test_pill_reads_the_partial_file(engine_state):
