@@ -28,6 +28,7 @@ vibevoice/
 ├── tools/
 │   └── smoke_streaming.py        # end-to-end smoke for the streaming path: real audio, real model, no mic
 ├── tests/
+│   ├── conftest.py               # session net: autosend/type_text are no-ops for the whole run
 │   ├── test_contract.py          # headless contract tests (no mic/GUI/model)
 │   └── test_app_bundle.py        # headless: builds VibeVoice.app, locks its shape
 └── .github/workflows/ci.yml      # macOS CI: ruff check + pytest

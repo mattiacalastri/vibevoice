@@ -141,10 +141,18 @@ CLEANUP_KEY_FILE = STATE_DIR / "cleanup_key"
 
 SAMPLE_RATE = 16000     # mlx_whisper expects 16 kHz mono
 CHANNELS = 1
-BLOCKSIZE = 1600        # ~100 ms per audio block at 16 kHz
+BLOCKSIZE = 800         # 50 ms per audio block at 16 kHz. Also the waveform's
+                        # data rate: the pill redraws at 24 fps but can only
+                        # MOVE when a new RMS sample lands, so at the old 100 ms
+                        # block each bar was held for 2.4 frames and the scroll
+                        # visibly stepped. Silero re-chunks to its own 512-sample
+                        # frames with carry, so it is indifferent to this.
 
 LEVELS_LEN = 60         # number of float32 RMS samples in levels.bin
-LEVELS_HZ = 10          # target write frequency for levels.bin (Hz)
+LEVELS_HZ = 20          # target write frequency for levels.bin (Hz) — must not
+                        # throttle below the block rate or the extra samples the
+                        # smaller BLOCKSIZE buys are thrown away before the pill
+                        # ever sees them
 
 HISTORY_MAX = 20        # max lines in history.jsonl
 
@@ -172,7 +180,8 @@ PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  #
 STREAM_PASTE = os.environ.get("VIBEVOICE_STREAM_PASTE", "1") == "1"
 MIN_DUR = 0.4           # discard utterances shorter than this (seconds)
 MAX_DUR = 15.0          # force finalize after this many seconds (short enough to keep each blob within the recognizer's comfort window + sustain rhythm on long dictation)
-PRE_ROLL_BLOCKS = 5     # blocks of audio kept before speech onset
+PRE_ROLL_BLOCKS = 10    # blocks kept before speech onset — a DURATION (0.5s at
+                        # BLOCKSIZE=800), and it is what saves the first syllable
 
 RETURN_DELAY = 1.5      # seconds between paste and Return keypress
 
@@ -1341,6 +1350,7 @@ class Engine:
             do_finalize = False
             partial_blocks = None   # set when a streaming pass is due this block
             partial_gen = 0
+            emit_levels = False     # deferred: written outside the lock
 
             with self._lock:
                 # Update level history; emit levels.bin while recording.
@@ -1348,7 +1358,9 @@ class Engine:
                 self._levels_tick += 1
                 if self._speaking and self._levels_tick >= self._levels_every:
                     self._levels_tick = 0
-                    write_levels(self._rms_history)
+                    # Deferred: file I/O never runs inside the lock (invariant #3).
+                    # At 20 Hz this matters twice as much as it did at 10.
+                    emit_levels = True
 
                 if speech:
                     # Speech present (decider's verdict).
@@ -1383,6 +1395,8 @@ class Engine:
                             do_finalize = "finalize"  # type: ignore[assignment]
 
             # File I/O and thread spawning happen outside the lock.
+            if emit_levels:
+                write_levels(self._rms_history)
             if do_finalize == "start":  # type: ignore[comparison-overlap]
                 write_state("recording")
                 write_levels(self._rms_history)

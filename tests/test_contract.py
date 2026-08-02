@@ -111,6 +111,32 @@ def test_levels_write_is_atomic(engine_state):
     assert not engine.LEVELS_TMP.exists()
 
 
+# ── Waveform cadence: the bars can only move as often as data arrives ────────
+
+def test_levels_data_rate_is_at_least_twenty_per_second():
+    """The pill redraws at 24 fps but can only *move* when a new RMS sample
+    lands. At one block per 100 ms each bar was held for 2.4 frames and the
+    scroll visibly stepped (reported from the live runtime, 2026-08-02).
+    """
+    blocks_per_sec = engine.SAMPLE_RATE / engine.BLOCKSIZE
+    assert blocks_per_sec >= 20, f"only {blocks_per_sec:.0f} waveform samples/s"
+    assert engine.LEVELS_HZ >= 20, "the writer would throttle away the extra samples"
+
+
+def test_levels_write_rate_is_not_throttled_below_the_block_rate():
+    """`_levels_every` must not silently drop back to one write per N blocks."""
+    eng = engine.Engine()
+    effective_hz = (engine.SAMPLE_RATE / engine.BLOCKSIZE) / eng._levels_every
+    assert effective_hz >= 20, f"levels.bin written only {effective_hz:.0f} times/s"
+
+
+def test_pre_roll_keeps_half_a_second_of_audio():
+    """Pre-roll is a DURATION, not a block count: it is what saves the first
+    syllable, and halving the block size must not halve it."""
+    pre_roll_s = engine.PRE_ROLL_BLOCKS * engine.BLOCKSIZE / engine.SAMPLE_RATE
+    assert pre_roll_s == pytest.approx(0.5, abs=0.06), f"{pre_roll_s:.2f}s of pre-roll"
+
+
 def test_levels_len_matches_pill_magic():
     """Cross-side guard: the pill hard-codes 60; the engine must agree."""
     assert engine.LEVELS_LEN == 60
@@ -312,6 +338,18 @@ def make_silero(monkeypatch):
         vad.stop()
 
 
+def _frames_after(n_blocks: int) -> int:
+    """Frames the re-chunker must have consumed after `n_blocks` full blocks.
+
+    Derived from the constants, never hard-coded: the law is "consume
+    floor(samples / SILERO_FRAME), carry the rest", and it must keep holding
+    when BLOCKSIZE changes (it went 1600 → 800 on 2026-08-02 to double the
+    waveform's data rate, and four tests that had baked in 1600/512 = 3 went
+    red — they were asserting an arithmetic coincidence, not the contract).
+    """
+    return (n_blocks * engine.BLOCKSIZE) // engine.SILERO_FRAME
+
+
 def _wait_until(predicate, timeout: float = 2.0) -> bool:
     """Poll `predicate` until true or timeout — the worker thread is async."""
     deadline = time.monotonic() + timeout
@@ -333,8 +371,8 @@ def test_silero_speech_probability_turns_speech_on(make_silero):
     vad.submit(quiet, rms=0.0)
 
     assert _wait_until(vad.is_speech), "worker never published a speech decision"
-    # Re-chunk contract: 2×1600 samples = exactly 6 full 512-frames (+128 carry)…
-    assert _wait_until(lambda: len(fake.feeds) == 6), "worker did not re-chunk 2 blocks into 6 frames"
+    # Re-chunk contract: whatever the block size, floor(samples/512) frames.
+    assert _wait_until(lambda: len(fake.feeds) == _frames_after(2)), "worker did not re-chunk 2 blocks"
     for i, feed in enumerate(fake.feeds):
         # …each fed as context (64) + frame (512) at 16 kHz — the v5 model contract.
         assert feed["input"].shape == (1, engine.SILERO_CONTEXT + engine.SILERO_FRAME)
@@ -353,7 +391,7 @@ def test_silero_music_high_rms_low_prob_is_not_speech(make_silero):
     assert rms >= engine.VAD_THRESHOLD  # sanity: the legacy threshold would say speech
 
     vad.submit(loud, rms=rms)
-    assert _wait_until(lambda: len(fake.feeds) >= 3), "worker never consumed the block"
+    assert _wait_until(lambda: len(fake.feeds) >= _frames_after(1)), "worker never consumed the block"
     assert vad.is_speech() is False
 
 
@@ -371,26 +409,26 @@ def test_silero_hysteresis_band_holds_previous_decision(make_silero):
     # Onset edge: prob ≥ SILERO_ONSET turns the decision ON.
     vad.submit(quiet, rms=0.0)
     assert _wait_until(vad.is_speech), "onset never turned speech on"
-    # One 1600-sample block = exactly 3 full 512-frames: wait for the block to
-    # be fully consumed before mutating the probability (worker is async).
-    assert _wait_until(lambda: len(fake.feeds) == 3), "first block not fully consumed"
+    # Wait for the block to be fully consumed before mutating the probability
+    # (the worker is async); the frame count follows from the constants.
+    assert _wait_until(lambda: len(fake.feeds) == _frames_after(1)), "first block not fully consumed"
 
     # Band while ON: the previous True must hold, not decay to False.
     fake.prob = band
     vad.submit(quiet, rms=0.0)
-    assert _wait_until(lambda: len(fake.feeds) == 6), "second block not fully consumed"
+    assert _wait_until(lambda: len(fake.feeds) == _frames_after(2)), "second block not fully consumed"
     assert vad.is_speech() is True, "hysteresis band dropped the ON decision"
 
     # Offset edge: prob ≤ SILERO_OFFSET turns the decision OFF.
     fake.prob = 0.1
     vad.submit(quiet, rms=0.0)
     assert _wait_until(lambda: not vad.is_speech()), "offset never turned speech off"
-    assert _wait_until(lambda: len(fake.feeds) == 9), "third block not fully consumed"
+    assert _wait_until(lambda: len(fake.feeds) == _frames_after(3)), "third block not fully consumed"
 
     # Band while OFF: the previous False must hold, not re-trigger True.
     fake.prob = band
     vad.submit(quiet, rms=0.0)
-    assert _wait_until(lambda: len(fake.feeds) == 12), "fourth block not fully consumed"
+    assert _wait_until(lambda: len(fake.feeds) == _frames_after(4)), "fourth block not fully consumed"
     assert vad.is_speech() is False, "hysteresis band re-raised the OFF decision"
 
 
@@ -430,7 +468,7 @@ def test_silero_midstream_failure_degrades_to_rms_fallback(monkeypatch, capsys):
     the last neural decision — the second leg of the ARCHITECTURE.md §2.3
     degradation contract (the onnxruntime-absent leg is locked by
     test_full_flow_without_onnxruntime_behaves_like_legacy)."""
-    fake = _ExplodingSileroSession(prob=0.9, explode_after=3)
+    fake = _ExplodingSileroSession(prob=0.9, explode_after=_frames_after(1))
     monkeypatch.setattr(engine, "_resolve_silero_model", lambda: "fake.onnx")
     monkeypatch.setattr(engine, "_ensure_onnxruntime", lambda: True)
     monkeypatch.setattr(engine, "_create_silero_session", lambda path: fake)
@@ -439,8 +477,8 @@ def test_silero_midstream_failure_degrades_to_rms_fallback(monkeypatch, capsys):
         worker = vad._worker
         quiet = np.zeros(engine.BLOCKSIZE, dtype=np.float32)
 
-        # Healthy stretch: the model (prob ≥ onset) decides speech on silence
-        # (one 1600-sample block = exactly explode_after=3 successful frames).
+        # Healthy stretch: the model (prob ≥ onset) decides speech on silence;
+        # one block is exactly explode_after successful frames.
         vad.submit(quiet, rms=0.0)
         assert _wait_until(vad.is_speech), "model never published speech pre-failure"
 
@@ -1252,7 +1290,10 @@ def test_a_chunk_typed_while_the_sentence_closes_is_not_repeated(engine_state, m
     monkeypatch.setattr(engine, "autosend", lambda text: landed.append(text))
 
     eng = engine.Engine()
+    # First pass has nothing to agree with yet — let it finish, or the second
+    # callback finds the single partial slot busy and silently skips its turn.
     eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+    _drain_partials(eng)
     # Second pass confirms "il polpo" and starts typing it — then blocks.
     eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
     assert typing_started.wait(timeout=5), "the partial pass never reached type_text"

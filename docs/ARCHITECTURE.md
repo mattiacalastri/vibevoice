@@ -269,7 +269,7 @@ A `pynput` global keyboard listener, independent of the engine. Behavior:
 | Constant | File | Value | Rationale |
 |----------|------|-------|-----------|
 | `SAMPLE_RATE` | engine | 16000 | mlx_whisper expects 16 kHz mono |
-| `BLOCKSIZE` | engine | 1600 | ~100 ms/block → VAD reacts within a tenth of a second |
+| `BLOCKSIZE` | engine | 800 | 50 ms/block. Also the **waveform's data rate**: the pill redraws at 24 fps but can only MOVE when a new RMS sample lands, so at 100 ms each bar was held for 2.4 frames and the scroll visibly stepped (reported live 2026-08-02). Silero re-chunks to its own 512-sample frames with carry, so its throughput is unchanged |
 | `VAD_THRESHOLD` | engine | 0.015 | RMS gate between noise floor and speech (fallback decision + levels feed) |
 | `SILERO_ONSET` / `SILERO_OFFSET` | engine | 0.5 / 0.35 | speech-probability hysteresis: ≥ onset → ON, ≤ offset → OFF, in between → hold |
 | `SILERO_FRAME` / `SILERO_CONTEXT` | engine | 512 / 64 | Silero v5 ONNX contract: samples per inference frame / context samples prepended |
@@ -277,10 +277,11 @@ A `pynput` global keyboard listener, independent of the engine. Behavior:
 | `SILENCE_SEC` | engine | 1.5 | trailing silence that ends an utterance |
 | `MIN_DUR` | engine | 0.4 | below this = noise, dropped |
 | `MAX_DUR` | engine | 15.0 | force-flush to keep blobs in the recognizer's comfort window + steady cadence on long dictation |
-| `PRE_ROLL_BLOCKS` | engine | 5 | ~0.5 s pre-speech so the first word isn't clipped |
+| `PRE_ROLL_BLOCKS` | engine | 10 | 0.5 s pre-speech so the first word isn't clipped — a **duration**, so it tracks any BLOCKSIZE change (locked by `test_pre_roll_keeps_half_a_second_of_audio`) |
 | `Semaphore` | engine | 2 | concurrent transcriptions → don't drop a long utterance's tail |
 | `RETURN_DELAY` | engine | 1.5 | gap between paste and the auto-Return |
-| `LEVELS_LEN` / `LEVELS_HZ` | engine | 60 / 10 | waveform ring buffer size / write rate |
+| `LEVELS_LEN` / `LEVELS_HZ` | engine | 60 / 20 | waveform ring buffer size / write rate. `LEVELS_HZ` must not throttle below the block rate or the extra samples are discarded before the pill sees them |
+| `PARTIAL_INTERVAL` / `STREAM_PASTE` | engine | 0.6 / on | seconds between streaming passes / type each confirmed chunk as it lands |
 | `N_BARS` | pill | 32 | waveform columns (downsampled from the 60 stored levels) |
 | `GAIN` / `VOICE_THRESH` | pill | 12.0 / 0.018 | waveform sensitivity / immediate-onset threshold |
 | `IDLE_HIDE_S` / `TICK` | pill | 1.5 / 1/24 | fade-out delay / 24 fps render |
