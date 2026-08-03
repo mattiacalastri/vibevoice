@@ -10,6 +10,18 @@
 # requirements.txt). That keeps the bundle small and reliable; for a fully
 # self-contained, signed, notarized app use py2app/PyInstaller on top of this.
 #
+# ── what this bundle CANNOT do (sess.9767) ───────────────────────────────────
+# Own the process name. The launcher below is a shell script that `exec`s the
+# host python3, and on a framework build that path resolves into
+# Python.framework/…/Resources/Python.app — the exec'd image, and therefore
+# `NSBundle.mainBundle()`, is *Python.app*. TCC identity is a property of the
+# bundle you launch; the Dock tile name is a property of the executable that
+# ends up running. This bundle wins the first and loses the second, so the Dock
+# says "Python" and the icon set here never gets a name to sit under.
+# For an app that is called VibeVoice:
+#   daily driver  →  bash packaging/install_dev_app.sh   (live source)
+#   distribution  →  bash packaging/build_release.sh     (self-contained)
+#
 # Usage:
 #   ./build_app.sh            # builds ./dist/VibeVoice.app
 #   ./build_app.sh /tmp/out   # builds /tmp/out/VibeVoice.app
@@ -31,7 +43,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # ── source the launcher runs (self-contained under Resources/) ────────────────
 cp "$SRC/vibevoice.py" "$SRC/engine.py" "$SRC/autosend.py" \
    "$SRC/requirements.txt" "$APP/Contents/Resources/"
-cp "$SRC/assets/icon/VibeVoice.icns" "$APP/Contents/Resources/"
+# The LED master, landed under the plist's CFBundleIconFile name. The file
+# literally called VibeVoice.icns is the RETIRED teal waveform that BRAND.md
+# forbids by name — it stayed wired here after the mark changed.
+cp "$SRC/assets/icon/VibeVoice_LED.icns" "$APP/Contents/Resources/VibeVoice.icns"
 
 # ── Info.plist — the bundle's identity + usage strings ────────────────────────
 # LSUIElement matches the app's NSApplicationActivationPolicyAccessory (notch

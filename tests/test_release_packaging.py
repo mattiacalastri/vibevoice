@@ -22,8 +22,9 @@ rebuilding the app on every pytest run:
 """
 from __future__ import annotations
 
-import ast
 from pathlib import Path
+
+from setup_options import py2app_options
 
 REPO = Path(__file__).resolve().parent.parent
 SETUP = REPO / "packaging" / "setup_py2app.py"
@@ -32,13 +33,13 @@ RELEASE = (REPO / "packaging" / "build_release.sh").read_text()
 
 def _py2app_options() -> dict:
     """Extract the OPTIONS dict via AST — importing setup_py2app.py would
-    execute setup() at module level and kick off a real build."""
-    for node in ast.walk(ast.parse(SETUP.read_text())):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "OPTIONS" for t in node.targets
-        ):
-            return ast.literal_eval(node.value)
-    raise AssertionError("OPTIONS dict not found in setup_py2app.py")
+    execute setup() at module level and kick off a real build.
+
+    The parsing lives in tests/setup_options.py: OPTIONS now references the
+    module-level VERSION constant, and a bare `ast.literal_eval` chokes on the
+    Name node. One reader, so a change to the packaging file cannot break one
+    test module and leave the other passing (sess.9767)."""
+    return py2app_options(SETUP)
 
 
 # ── py2app scan configuration ─────────────────────────────────────────────────

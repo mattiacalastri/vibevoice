@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from setup_options import py2app_options
 
 REPO = Path(__file__).resolve().parent.parent
 BUILD = REPO / "build_app.sh"
@@ -104,13 +105,69 @@ def test_bundle_has_icon(app):
 
 
 def test_icon_respects_transparent_margin():
-    """Scar sess.9161: corners must be transparent (squircle inside the canvas)."""
+    """Scar sess.9161: corners must be transparent (squircle inside the canvas).
+
+    Guards the LED master — the mark. `VibeVoice.icns` (no suffix) is the
+    retired teal waveform, and this test used to guard THAT: a green assertion
+    on a file no bundle was supposed to ship any more (sess.9767).
+    """
     PIL = pytest.importorskip("PIL.Image")
-    img = PIL.open(REPO / "assets/icon/VibeVoice.icns")
+    img = PIL.open(REPO / "assets/icon/VibeVoice_LED.icns")
     img = img.convert("RGBA")
     w, h = img.size
     for xy in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]:
         assert img.getpixel(xy)[3] == 0, f"corner {xy} not transparent"
+
+
+# ── shipped identity (what the Dock, Finder and About box read) ──────────────
+
+def test_shipped_bundle_wears_the_led_mark():
+    """The release bundle shipped the RETIRED teal waveform for a month.
+
+    BRAND.md forbids it twice over — the wave "names the category, not the
+    product", and the teal is Astra Digital's colour on an app that is not
+    agency work. Nothing that builds a bundle may point back at it.
+    """
+    assert py2app_options()["iconfile"] == "assets/icon/VibeVoice_LED.icns"
+    launcher_build = (REPO / "build_app.sh").read_text()
+    assert "assets/icon/VibeVoice_LED.icns" in launcher_build
+    assert 'cp "$SRC/assets/icon/VibeVoice.icns"' not in launcher_build
+
+
+def test_shipped_plist_is_fully_identified():
+    """Metadata a real app carries — and py2app does not fill in for you.
+
+    Every one of these was missing or wrong on the installed bundle: the About
+    box read the py2app default "Copyright not specified", Finder filed the app
+    under Other for want of a category, and NSHighResolutionCapable was absent
+    on a Retina-only product.
+    """
+    plist = py2app_options()["plist"]
+    assert plist["CFBundleName"] == "VibeVoice"
+    assert plist["CFBundleDisplayName"] == "VibeVoice"
+    assert plist["CFBundleIdentifier"] == "com.vibevoice.app"
+    assert plist["CFBundleShortVersionString"] == plist["CFBundleVersion"]
+    assert "not specified" not in plist["NSHumanReadableCopyright"]
+    assert "MIT" in plist["NSHumanReadableCopyright"]
+    assert plist["LSApplicationCategoryType"].startswith("public.app-category.")
+    assert plist["NSHighResolutionCapable"] is True
+    assert plist["LSMultipleInstancesProhibited"] is True
+
+
+def test_dev_installer_asserts_the_dock_name_by_effect():
+    """The daily driver's whole point is the name macOS registers.
+
+    A plist that *says* VibeVoice proves nothing: the old LaunchAgent ran the
+    framework interpreter, which re-execs into Python.app, and the Dock said
+    "Python" while every plist on disk said otherwise. So the installer has to
+    read the name back out of LaunchServices, and that check must not quietly
+    disappear from it.
+    """
+    body = (REPO / "packaging" / "install_dev_app.sh").read_text()
+    assert "lsappinfo info -only name" in body
+    assert 'NAME" = "VibeVoice"' in body or '[ "$NAME" = "VibeVoice" ]' in body
+    # _child_python() needs the embedded interpreter, or the pill forks itself.
+    assert "Contents/MacOS/python" in body
 
 
 # ── child process spawning (py2app trap) ─────────────────────────────────────
