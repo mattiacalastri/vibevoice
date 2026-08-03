@@ -31,6 +31,18 @@ REPO = Path(__file__).resolve().parent.parent
 
 # (label, file, find, replace, test that must catch it)
 MUTATIONS: list[tuple[str, str, str, str, str]] = [
+    ("warm-up cadence: go back to one flat interval",
+     "engine.py",
+     "    return PARTIAL_INTERVAL if has_delivered else min(PARTIAL_INTERVAL, PARTIAL_WARMUP)",
+     "    return PARTIAL_INTERVAL",
+     "test_the_first_character_arrives_a_third_of_a_second_sooner"),
+
+    ("warm-up: end it on confirmed instead of delivered",
+     "engine.py",
+     "                if len(draft.split()) >= 2:\n                    self._has_delivered = True",
+     "                if draft:\n                    self._has_delivered = True",
+     "test_the_engine_leaves_the_warmup_cadence_once_a_word_reaches_the_app"),
+
     ("stabilizer: go back to trusting positions",
      "engine.py",
      "        here = _locate(self._committed, words)\n        there = _locate(self._committed, prev)",

@@ -1354,6 +1354,244 @@ def test_streaming_off_behaves_exactly_like_the_legacy_engine(engine_state, monk
     assert not engine.PARTIAL_FILE.exists()
 
 
+# ── Time to the first character: the number the product is sold on ───────────
+# Everything above proves the streaming path is WIRED. None of it proves it is
+# FAST, because every one of those tests sets PARTIAL_INTERVAL to 0 and skips
+# the cadence policy entirely — which is exactly how a 1.4 s wait survived 190
+# green tests. These tests measure the wait instead.
+
+_MEASURED_DECODE_S = 0.17      # one partial pass, M5 Max / whisper-turbo (AGENTS.md);
+                               # flat in buffer length — Whisper pads to 30 s anyway
+
+# What whisper-turbo ACTUALLY returns for the smoke sentence, buffer length by
+# buffer length, recorded 2026-08-03 by decoding each prefix once (pre-roll
+# included, exactly as the engine assembles it). Verbatim and not a rate model:
+# the first attempt here assumed words arrive at a steady 3/s, which flattered
+# short buffers and predicted a win the live tool then refuted. Whisper on a
+# sliver of speech does not return fewer words — it returns WRONG ones, and it
+# keeps changing its mind ("Il Polo" → "Il Poltino" → "Il polpo"). That churn is
+# the whole reason LocalAgreement needs two passes, so a model that smooths it
+# away cannot be used to reason about latency.
+_HEARD_AT: dict[float, str] = {
+    0.05: "Grazie a tutti.",          # the hallucination on near-silence, verbatim
+    0.10: "Is",
+    0.15: "E",
+    0.20: "E ba ba ba ba ba ba ba ba",
+    0.25: "Il po'",
+    0.30: "Il Polo",
+    0.35: "Il Poltino",
+    0.40: "Il polpo",
+    0.45: "Il polpo è",
+    0.50: "Il polpo a",
+    0.55: "Il polpo a ove.",
+    0.60: "Il Polpo è",
+    0.65: "Il Polpo è ottenuto.",
+    0.70: "Il polpo è 8.",
+    0.75: "Il polpo è 8.",
+    0.80: "Il polpo è 8 tessere.",
+    0.85: "Il polpo a 8 tess.",
+    0.90: "Il polpo a 8 tenei.",
+    0.95: "Il polpo a 8 tentative.",
+    1.00: "Il polpo a 8 tentativi.",
+    1.05: "Il polpo a 8 tentacoli.",
+    1.10: "Il polpo a 8 tentacoli.",
+    1.15: "Il polpo a 8 tentacoli.",
+    1.20: "Il polpo a 8 tentacoli.",
+}
+
+
+def _heard_after(t: float) -> str:
+    """The recognizer's answer for a buffer holding `t` seconds of speech."""
+    grid = min(_HEARD_AT, key=lambda g: abs(g - t))
+    return _HEARD_AT[grid] if t <= max(_HEARD_AT) else _HEARD_AT[max(_HEARD_AT)]
+
+
+def _seconds_to_first_typed_character(
+    *,
+    decode_s: float = _MEASURED_DECODE_S,
+    horizon: float = 8.0,
+) -> float | None:
+    """Replay the streaming scheduler on a fake clock; return when the app would
+    receive its first character, in seconds after speech onset.
+
+    A model, and it says so — but every part of it that could lie is real. It
+    runs the **real** `engine.partial_interval` and the **real**
+    `engine.LocalAgreement` over the **recorded** answers of the real
+    recognizer, and it mirrors the three rules the audio callback follows: one
+    decode slot, the timer resetting on dispatch whether or not the slot was
+    free, and the one-word lag before anything is typed.
+
+    Calibrated against the live tool, not asserted into existence — see
+    `test_the_scheduler_model_reproduces_the_measured_baselines`.
+    """
+    agree = engine.LocalAgreement()
+    block_s = engine.BLOCKSIZE / engine.SAMPLE_RATE
+    t = 0.0
+    t_partial = 0.0             # the engine seeds this at utterance onset
+    in_flight: tuple[float, str] | None = None
+
+    while t < horizon:
+        if in_flight is not None and t >= in_flight[0]:
+            agree.update(in_flight[1])
+            in_flight = None
+            # The stream types the confirmed prefix minus its last word, so two
+            # confirmed words are what it takes to put one on screen.
+            if len(agree.confirmed.split()) >= 2:
+                return round(t, 3)
+        if t - t_partial >= engine.partial_interval(len(agree.confirmed.split()) >= 2):
+            t_partial = t
+            if in_flight is None:
+                in_flight = (t + decode_s, _heard_after(t))
+        t += block_s
+    return None
+
+
+def test_the_scheduler_model_reproduces_the_measured_baselines(monkeypatch):
+    """The model is only worth its assertions if it agrees with the real thing.
+
+    `tools/smoke_streaming.py` — real audio, real Whisper, wall clock — was run
+    interleaved on both cadences, three times each on 2026-08-03: the flat 0.6 s
+    schedule put the first character at 1.4 s every single time, and the 0.45 s
+    warm-up at 1.0/1.1/1.1 s. The model must land on both. If this ever drifts,
+    the budget below is measuring a fiction and must not be trusted until the
+    model is re-recorded against the tool.
+    """
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", engine.PARTIAL_INTERVAL)  # the old flat cadence
+    flat = _seconds_to_first_typed_character()
+    assert flat is not None and abs(flat - 1.4) <= 0.05, (
+        f"model says {flat}s where the live tool measured 1.4s flat — re-record it"
+    )
+
+    monkeypatch.undo()
+    warmed = _seconds_to_first_typed_character()
+    assert warmed is not None and abs(warmed - 1.05) <= 0.10, (
+        f"model says {warmed}s where the live tool measured 1.0–1.1s — re-record it"
+    )
+
+
+def test_the_first_character_arrives_a_third_of_a_second_sooner():
+    """The product claim, as a number.
+
+    The competitor transcribes while you talk; this engine made you wait 1.4 s
+    for the first character on a clean synthetic sentence — and a p50 of 2.31 s
+    on the real dictation ledger. The wait is not the decode (170 ms): it is
+    `2 × cadence`, because LocalAgreement-2 publishes nothing until two passes
+    have agreed. Moving the first pass earlier — without adding passes, which
+    measurement showed makes it worse — is what buys the difference between text
+    that follows the voice and text that trails it.
+    """
+    first = _seconds_to_first_typed_character()
+
+    assert first is not None, "no character was ever typed within the horizon"
+    assert first <= 1.15, f"first character at {first}s — the wait is back"
+
+
+def test_the_warmup_does_not_buy_the_first_character_with_more_passes(monkeypatch):
+    """The scar of this fix, kept executable.
+
+    The obvious move — decode far more often while the line is empty — was tried
+    and measured, and it lost: 1.1–2.1 s live against a steady 1.4 s. A cadence
+    below the decode cost plus its jitter loses whole turns (the timer resets on
+    dispatch, free slot or not), and agreement needs *consecutive* hypotheses.
+    So the warm-up must stay comfortably above one decode. Whoever tunes this
+    down next should have to delete this test on purpose.
+    """
+    assert engine.PARTIAL_WARMUP >= 2 * _MEASURED_DECODE_S, (
+        f"a {engine.PARTIAL_WARMUP}s warm-up leaves under "
+        f"{engine.PARTIAL_WARMUP - _MEASURED_DECODE_S:.2f}s of slack on a "
+        f"{_MEASURED_DECODE_S}s decode — jitter will eat the turns"
+    )
+
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.25)
+    assert _seconds_to_first_typed_character() is not None
+
+
+def test_the_cadence_is_tighter_only_until_the_first_word_is_confirmed():
+    """Two regimes, one knob. Spending passes is cheap while the line is empty
+    and wasteful once text is flowing — where extra passes buy only freshness
+    and add pressure on the paste queue, which the ledger already blames for 58
+    stood-down turns out of 113."""
+    assert engine.partial_interval(False) == engine.PARTIAL_WARMUP
+    assert engine.partial_interval(True) == engine.PARTIAL_INTERVAL
+    assert engine.PARTIAL_WARMUP < engine.PARTIAL_INTERVAL, (
+        "a warm-up at or above the steady cadence is the old behaviour wearing a new name"
+    )
+
+
+def test_the_warmup_can_only_make_the_engine_more_eager(monkeypatch):
+    """A floor, not a second cadence. Someone who asks for passes every 0.1 s
+    everywhere must not get a 0.25 s wait for the word they are waiting on."""
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.1)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.25)
+
+    assert engine.partial_interval(False) == 0.1
+
+
+def test_the_engine_leaves_the_warmup_cadence_once_a_word_reaches_the_app(
+    engine_state, monkeypatch
+):
+    """The policy has to be the one the audio thread actually consults.
+
+    A pure function nobody calls is the classic way for this fix to rot. So:
+    make the two regimes impossible to confuse — warm-up fires on every block,
+    steady fires never — and count the passes. Two passes are what
+    LocalAgreement needs to confirm anything; the third block must find the
+    engine already back on the steady cadence and stay silent.
+    """
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.0)      # always due
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 10.0)   # never due
+
+    # Hypotheses chosen so that "confirmed" and "delivered" happen on DIFFERENT
+    # passes — otherwise the test cannot tell the two apart, and a version that
+    # ends the warm-up one pass early passes it just as happily. (It did: the
+    # mutation check called that out before this file was committed.)
+    #   pass 1  "il polpo"       → nothing yet, no previous hypothesis
+    #   pass 2  "il gatto"       → agrees on "il" alone: confirmed, but the
+    #                              one-word lag means the app still has nothing
+    #   pass 3  "il gatto nero"  → "gatto" agrees too: now a word comes free
+    hypotheses = iter(["il polpo", "il gatto", "il gatto nero"])
+    monkeypatch.setattr(engine, "transcribe",
+                        lambda audio: next(hypotheses, "il gatto nero"))
+
+    eng = engine.Engine()
+    for _ in range(4):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert eng._has_delivered is True, "the third pass frees a word for the app"
+    assert eng._partials == 3, (
+        f"{eng._partials} passes: the warm-up ended on the CONFIRMED word instead "
+        "of the delivered one, so the fourth block found the steady cadence and "
+        "the user waits a full interval for a character that was one pass away"
+    )
+
+
+def test_a_new_utterance_starts_blind_again(engine_state, monkeypatch):
+    """The warm-up is per-utterance. If the flag survived the close, the second
+    sentence of a dictation would pay the full steady cadence for its first
+    word — and back-to-back utterances are the common case, not the edge."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.0)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 10.0)
+    monkeypatch.setattr(engine, "SILENCE_SEC", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(3):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    assert eng._has_delivered is True
+
+    # Silence closes the utterance, then speech opens the next one.
+    eng._audio_callback(_speech_block(0.0), engine.BLOCKSIZE, None, None)
+    eng._audio_callback(_speech_block(0.0), engine.BLOCKSIZE, None, None)
+    _drain_finals(eng)
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+
+    assert eng._has_delivered is False, "the next sentence must start on the warm-up cadence"
+
+
 # ── Streaming paste: typing the confirmed words while the sentence is open ────
 # The confirmed prefix never retracts — that is exactly what makes it safe to
 # type. What must never happen is typing the same words twice: the final paste

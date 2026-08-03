@@ -179,6 +179,53 @@ SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing sile
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
 PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
+PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.45"))  # cadence before the first word reaches the app
+
+
+def partial_interval(has_delivered: bool) -> float:
+    """Seconds the engine waits before the next streaming pass.
+
+    Two regimes, because the two are worth different things. Until the first
+    word is confirmed the user is staring at an empty line, and LocalAgreement-2
+    cannot publish anything before **two** passes have agreed — so the wait to
+    the first character is `2 × interval + one decode`, and nothing else. At a
+    flat 0.6 s that is 1.37 s in the scheduler model and measured **1.4 s** by
+    `tools/smoke_streaming.py`; on real dictation the ledger put the p50 at
+    2.31 s. That number is the whole gap between "it transcribes while you talk"
+    and "it transcribes after you stop".
+
+    The warm-up does NOT buy that back by decoding more often. Measured
+    2026-08-03 against the real model: at 0.25 s the first character got *worse*
+    and erratic on the live path (1.1–2.1 s over five runs, against a rock-steady
+    1.4 s), because a pass costs ~170 ms and the timer resets on dispatch whether
+    or not the slot was free — so a cadence with only 80 ms of slack loses whole
+    turns to decode jitter, and LocalAgreement needs *consecutive* hypotheses.
+    Short buffers are also where Whisper is least trustworthy: 0.20 s of speech
+    decodes to "E ba ba ba ba…", 0.35 s to "Il Poltino".
+
+    0.45 s is the setting that moves the first pass earlier while keeping the
+    pass count at two and leaving ~280 ms of slack. Interleaved A/B on the live
+    tool, n=3 a side: **1.4/1.4/1.4 s → 1.0/1.1/1.1 s**, no fidelity defects.
+    Once text is flowing the extra freshness is worth much less than the CPU and
+    the paste-queue pressure it creates, so the steady cadence resumes.
+
+    A floor and not a second cadence: the warm-up may only make the engine
+    *more* eager, never less. Someone who lowers `VIBEVOICE_PARTIAL_INTERVAL`
+    below the warm-up is asking for faster passes everywhere, and a warm-up that
+    then slowed the first word down would be the opposite of what it is for.
+
+    `has_delivered` means text reached the user, not text was confirmed — the
+    two are one pass apart because of the one-word lag, and getting it wrong
+    costs the whole feature. Measured 2026-08-03: ending the warm-up on the
+    first *confirmed* word moved the live draft earlier (1.4 s → 1.2 s) and the
+    first *typed* character LATER (1.4 s → 1.8 s), because the pass that would
+    have released that word had already dropped back to the steady cadence.
+    The number the user feels is the typed one.
+
+    Pure and synchronous: the audio thread calls this, and per invariant #6 it
+    may not block. `has_delivered` is a plain flag read, never a lock.
+    """
+    return PARTIAL_INTERVAL if has_delivered else min(PARTIAL_INTERVAL, PARTIAL_WARMUP)
 # Streaming paste: type each confirmed chunk into the frontmost app as it is
 # confirmed, instead of pasting the whole sentence after the trailing silence.
 # Safe only because the confirmed prefix never retracts. `0` restores the single
@@ -1487,6 +1534,12 @@ class Engine:
         self._streamed_by_gen: dict[int, str] = {}
         self._t_first_typed = 0.0             # when the first character of THIS utterance reached the app
         self._partials = 0                    # streaming passes run for THIS utterance
+        # Which cadence regime the audio thread is in (see partial_interval).
+        # A plain bool and not a look at `self._agree`, because the callback may
+        # not take _agree_lock: per invariant #6 the audio thread is allowed an
+        # attribute read and nothing else. Written by the partial worker, read
+        # by the callback — a lost update costs one pass of cadence, never text.
+        self._has_delivered = False
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -1622,7 +1675,8 @@ class Engine:
                     self._buf.append(block)
                     if now - self._t_start >= MAX_DUR:
                         do_finalize = "finalize"  # type: ignore[assignment]
-                    elif STREAMING and now - self._t_partial >= PARTIAL_INTERVAL:
+                    elif (STREAMING and now - self._t_partial
+                          >= partial_interval(self._has_delivered)):
                         # Due for a streaming pass. Snapshot the block LIST only
                         # (references, no audio copy) — the concatenate happens
                         # on the worker, never on the audio thread.
@@ -1650,6 +1704,9 @@ class Engine:
                     self._streamed = ""
                     self._t_first_typed = 0.0
                     self._partials = 0
+                    # A new utterance starts blind again: the warm-up cadence is
+                    # per-utterance, not per-session.
+                    self._has_delivered = False
                     # Seed this utterance's record with its own onset, so the
                     # KPI cannot later borrow the successor's.
                     self._utt_record(self._utt_gen)["start"] = self._t_start
@@ -1787,6 +1844,11 @@ class Engine:
                 self._utt_record(gen)["partials"] += 1
                 self._agree.update(text)
                 draft = self._agree.confirmed
+                # Leave the warm-up only once a word has actually come free for
+                # the app. The one-word lag holds the newest confirmed word
+                # back, so one confirmed word is still an empty screen.
+                if len(draft.split()) >= 2:
+                    self._has_delivered = True
                 # Claim the chunk under the same lock that produced it, so two
                 # passes can never type overlapping text.
                 to_type = ""
