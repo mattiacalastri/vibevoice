@@ -176,13 +176,26 @@ def afplay_sound(sound: str) -> None:
 
 def simulate_return():
     """Simulate the Return key via osascript. Returns CompletedProcess so the
-    caller can check for errors."""
-    return subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to key code 36'],
-        capture_output=True,
-        text=True,
-    )
+    caller can check for errors.
+
+    Bounded, like every other osascript call in this file: without Accessibility
+    permission System Events can sit on a consent prompt indefinitely, and this
+    runs on the timer thread — an unbounded wait there wedges the daemon with no
+    error and no Return. A timeout surfaces as a non-zero returncode, which the
+    caller already logs.
+    """
+    try:
+        return subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to key code 36'],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["osascript"], returncode=1, stdout="",
+            stderr="timed out after 5s (Accessibility permission?)")
 
 
 def get_frontmost_signature() -> str:
@@ -266,6 +279,10 @@ class AutoSendDaemon:
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._held: set = set()
+        # Where the current burst of typing started: (app, window signature),
+        # or None between bursts. See _schedule_send for why it is captured
+        # once per burst and not once per keystroke.
+        self._snap: tuple[str, str] | None = None
 
         # Modifier keys — they do not reset the silence timer
         self._modifiers = {
@@ -286,16 +303,34 @@ class AutoSendDaemon:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
+            self._snap = None      # the burst is over; the next one re-reads
 
     def _schedule_send(self) -> None:
         # Snapshot the frontmost window signature (lock at window level, not
-        # just app level, so we don't fire into a different window).
-        snap_sig = get_frontmost_signature()
-        try:
-            snap_app = NSWorkspace.sharedWorkspace().activeApplication().get("NSApplicationName", "") if HAS_APPKIT else ""
-        except Exception:
-            snap_app = ""
+        # just app level, so we don't fire into a different window) — ONCE per
+        # burst of typing, then reuse it while the timer keeps being pushed out.
+        #
+        # This runs inside pynput's key callback, i.e. on the CGEventTap thread,
+        # and get_frontmost_signature() spawns up to two osascript calls that
+        # measure ~145 ms EACH on this machine. Per keystroke that stalled the
+        # tap for ~290 ms; macOS disables an event tap whose callback overruns,
+        # so fast typing could kill the daemon outright — and every held key
+        # burned two processes. Once per burst is also the more correct
+        # semantic: the signature you want is where the sentence STARTED, so a
+        # window change mid-sentence now shows up as a change and skips the
+        # Return, which is exactly the check's purpose.
         with self._lock:
+            snap = self._snap
+        if snap is None:
+            sig = get_frontmost_signature()
+            try:
+                app = NSWorkspace.sharedWorkspace().activeApplication().get("NSApplicationName", "") if HAS_APPKIT else ""
+            except Exception:
+                app = ""
+            snap = (app, sig)
+        snap_app, snap_sig = snap
+        with self._lock:
+            self._snap = snap
             if self._timer:
                 self._timer.cancel()
             t = threading.Timer(self.delay, self._fire, args=(snap_app, snap_sig))
@@ -311,6 +346,12 @@ class AutoSendDaemon:
 
     def _fire(self, scheduled_app: str = "", scheduled_sig: str = "",
               waited: float = 0.0) -> None:
+        # The burst that armed this timer is over: whatever the outcome below,
+        # the next keystroke starts a new one and re-reads the frontmost window.
+        # The pause retries below don't need it — they carry their snapshot in
+        # their own arguments.
+        with self._lock:
+            self._snap = None
         if not is_enabled():
             return
         # Paused mid-dictation. Returning here dropped the Return for the

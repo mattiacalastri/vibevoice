@@ -21,7 +21,7 @@ Three processes, zero shared imports, file-only IPC:
            ┌──────────────────┴──┐          │               │   ┌──────────────────────┐
            │      engine.py      │          └───────────────┴──►│     vibevoice.py     │
            │  (capture + ASR +   │                              │   (the pill UI)      │
-           │   paste daemon)     │◄─── pgrep/pkill -f engine.py ─┤  menu-bar switch     │
+           │   paste daemon)     │◄── pgrep/pkill -f $ENGINE_PATH┤  menu-bar switch     │
            └─────────┬───────────┘                              └──────────────────────┘
                      │ pbcopy + Cmd+V (CGEvent @ HID tap)
                      ▼
@@ -239,9 +239,11 @@ non-activating panel).
 
 ### 3.4 Master switch
 The menu-bar item (`🎙`/`🔇`) toggles the engine by shelling out:
-`pgrep -f engine.py` (running?), `Popen([python, engine.py], start_new_session=True)`
-(start), `pkill -f engine.py` (stop). This is why the engine's **filename** is part of
-the contract (invariant #8).
+`pgrep -f "$ENGINE_PATH"` (running?), `Popen([python, ENGINE_PATH],
+start_new_session=True)` (start), `pkill -f "$ENGINE_PATH"` (stop) — the pattern is
+the **absolute path**, so the switch answers for the engine it spawned and not for
+any process that merely carries the string `engine.py` in argv. The engine's
+**filename** is still part of the contract (invariant #8): it is the tail of that path.
 
 ---
 

@@ -40,6 +40,7 @@ def daemon(tmp_path, monkeypatch):
     d = autosend.AutoSendDaemon.__new__(autosend.AutoSendDaemon)
     d._lock = threading.Lock()
     d._timer = None
+    d._snap = None
     d.delay = 0.05
     return d, fired, disarmed
 
@@ -113,3 +114,57 @@ def test_a_pause_that_never_lifts_disarms_instead_of_lurking(daemon, tmp_path, m
 
     assert fired == [], "never press Return into a pause that never lifted"
     assert disarmed == [False], "but do disarm, so nothing fires later by surprise"
+
+
+# ── the cost of the check itself ─────────────────────────────────────────────
+
+def test_the_frontmost_window_is_read_once_per_burst_not_once_per_key(daemon, monkeypatch):
+    """`_schedule_send` runs inside pynput's key callback — on the event-tap
+    thread. `get_frontmost_signature()` spawns up to two osascript calls, ~145 ms
+    each on this machine, so reading it per keystroke stalled the tap ~290 ms
+    every time a key went down. macOS disables an event tap whose callback
+    overruns: typing fast enough could stop the daemon dead.
+
+    Once per burst is also the more correct reading — the signature you want is
+    where the sentence STARTED, so leaving the window mid-sentence now registers
+    as a change and the Return is skipped.
+    """
+    d, _fired, _disarmed = daemon
+    reads = []
+    monkeypatch.setattr(autosend, "get_frontmost_signature",
+                        lambda: reads.append(1) or "Terminal::wid::1")
+    monkeypatch.setattr(autosend, "HAS_APPKIT", False)
+
+    for _ in range(20):                   # one burst of twenty keystrokes
+        d._schedule_send()
+    d._cancel_timer()
+
+    assert len(reads) == 1, f"read the frontmost window {len(reads)}× for 20 keys"
+
+    for _ in range(5):                    # a new burst re-reads it
+        d._schedule_send()
+    d._cancel_timer()
+    assert len(reads) == 2, "a fresh burst must take a fresh snapshot"
+
+
+def test_a_hanging_osascript_does_not_wedge_the_timer_thread(monkeypatch):
+    """System Events can sit on a consent prompt forever without Accessibility.
+
+    `simulate_return` runs on the timer thread; an unbounded wait there wedges
+    the daemon with no error and no Return — the failure mode with the least
+    evidence there is. The timeout must surface as a non-zero returncode, which
+    `_fire` already logs, and never as an exception escaping into the thread.
+    """
+    import subprocess as sp
+
+    def hang(*a, **kw):
+        assert kw.get("timeout"), "simulate_return must bound its osascript"
+        raise sp.TimeoutExpired(cmd="osascript", timeout=kw["timeout"])
+
+    monkeypatch.setattr(autosend.subprocess, "run", hang)
+    # The real one — conftest stubs the module attribute for the whole session,
+    # and asserting against that stub would pass for free. Safe here: the only
+    # thing it can reach, subprocess.run, is the raiser above.
+    result = autosend._REAL_simulate_return()    # must not raise
+    assert result.returncode != 0
+    assert "timed out" in result.stderr

@@ -28,8 +28,9 @@ A macOS speech-to-text utility: three decoupled processes (`engine.py`,
    `struct.unpack("<60f", ...)` — keep them in lockstep. Grep first:
    `grep -rn "levels.bin\|raw.txt\|\.vibevoice/state" .`
 5. **Don't rename `engine.py`** without updating all three `pgrep/pkill -f
-   engine.py` call sites in `vibevoice.py` and keeping it a sibling of the pill
-   (invariants #8 / #10 in `AGENTS.md`).
+   "$ENGINE_PATH"` call sites in `vibevoice.py` and keeping it a sibling of the
+   pill (invariants #8 / #10 in `AGENTS.md`). Those patterns are the **absolute
+   path** on purpose — never widen them back to the bare filename.
 6. **The audio callback must never raise — and never block.** `Engine._audio_callback`
    runs on the realtime capture thread (sounddevice or the voice-processing
    worker) and swallows exceptions on purpose. Do not add throwing or blocking

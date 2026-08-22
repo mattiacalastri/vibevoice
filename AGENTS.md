@@ -160,9 +160,14 @@ because the code keeps "working" in the happy path.
 7. **`autosend.py` is one-shot.** After it fires one Return it disarms itself
    (`set_enabled(False)`). This prevents a "zombie ON" state from pressing Return while
    the user later types by hand. Do not make it persistent-by-default.
-8. **The master switch finds the engine by process name `engine.py`** (`pgrep -f` /
-   `pkill -f` in the pill). If you rename `engine.py`, you break start/stop/“is it
-   running” detection in `vibevoice.py`. Update all three call sites if you must rename.
+8. **The master switch finds the engine by its absolute path** — `pgrep -f` /
+   `pkill -f` in the pill match `str(ENGINE_PATH)`, i.e. the exact argv the pill
+   spawns, not the bare name. If you rename `engine.py`, you still break
+   start/stop/“is it running” detection in `vibevoice.py` (the path ends in that
+   name); update all three call sites if you must rename. Never widen the pattern
+   back to the bare name: `pgrep -f engine.py` matches any stranger carrying that
+   string in argv, and the `pkill` half then kills it (locked by
+   `tests/test_lifecycle.py`).
 9. **The three processes share no Python imports.** Coupling is via files only. Do not
    "simplify" by importing `engine` into `vibevoice` (or vice-versa) — it would couple
    their lifecycles and defeat the crash-isolation the file contract buys.
@@ -414,12 +419,16 @@ These are deliberate trade-offs, documented so an agent doesn't "repair" them
 into a regression. Improve them only with a design that preserves the invariants
 in §3 — and update this section if you do.
 
-1. **Broad process match for start/stop.** The pill uses `pgrep -f engine.py` /
-   `pkill -f engine.py` (§3 invariant #8). This matches *any* process whose
-   command line contains `engine.py`, so it cannot distinguish two instances and
-   could touch an unrelated `engine.py`. It is the simplest reliable supervisor
-   for the single-user, single-instance design. If you make it PID-tracked,
-   preserve start / stop / "is it running" and keep the filename contract intact.
+1. **Process match for start/stop is by path, not by PID.** The pill matches
+   `pgrep -f "$ENGINE_PATH"` / `pkill -f "$ENGINE_PATH"` (§3 invariant #8). It
+   still cannot distinguish two instances launched from the *same* path — that
+   would need PID tracking, and the single-user design does not earn it. What it
+   no longer does is answer for strangers: the pattern used to be the bare
+   `engine.py`, which matched an editor open on the file, a `tail -f`, or another
+   project's `engine.py` entirely (reproduced 2026-08-06 — the pill saw a
+   stranger, refused to start its own engine, and `pkill` would have killed the
+   stranger). Anchoring cost nothing: no PID bookkeeping, the filename contract
+   intact. If you do make it PID-tracked, preserve start / stop / "is it running".
 2. **Clipboard is overwritten, not restored.** `engine.autosend()` `pbcopy`s the
    transcription and pastes it; the user's previous clipboard is lost. Restoring
    it is possible but races with fast successive dictations — left simple on

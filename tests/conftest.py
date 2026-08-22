@@ -64,6 +64,13 @@ def _no_outbound_effects_during_tests(tmp_path_factory):
     # its own path to the keyboard, so it needs the same floor as the engine.
     try:
         import autosend as _autosend
+        # Keep a handle on the real one. The no-op below is the default for the
+        # whole session — nothing reaches the keyboard by accident — but a test
+        # that wants to assert something ABOUT the real function (that it bounds
+        # its osascript, say) would otherwise be asserting against the stub and
+        # passing for free. Using it is deliberate, and safe only with
+        # `subprocess.run` patched.
+        _autosend._REAL_simulate_return = _autosend.simulate_return
         patch.setattr(_autosend, "simulate_return",
                       lambda *a, **k: type("R", (), {"returncode": 0, "stderr": ""})())
         patch.setattr(_autosend, "afplay_sound", lambda *a, **k: None)

@@ -304,7 +304,21 @@ keys and simulates Return).
 
 A LaunchAgent template is included as **[`com.vibevoice.pill.plist`](com.vibevoice.pill.plist)**
 (`RunAtLoad` + `KeepAlive`). It runs `python3 ~/projects/vibevoice/vibevoice.py`
-on login and keeps it alive.
+on login and restarts it if it **crashes**.
+
+Crash, not quit: `KeepAlive` is `{SuccessfulExit: false}`, not plain `true`.
+With `true`, launchd relaunches the pill whatever the exit code — which makes
+the menu's own **Quit (close everything)** a lie, since a clean quit exits 0 and
+comes straight back (with the engine behind it, when
+`VIBEVOICE_ENGINE_AUTOSTART=1`). The only escape is then `launchctl bootout`,
+which nobody should need to know. If you already installed a copy with
+`KeepAlive: true`, replace it and reload:
+
+```bash
+launchctl bootout gui/$UID/com.vibevoice.pill    # ignore "No such process"
+cp com.vibevoice.pill.plist ~/Library/LaunchAgents/   # re-edit the placeholders
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.vibevoice.pill.plist
+```
 
 **All-in-one:** the template sets `VIBEVOICE_ENGINE_AUTOSTART=1`, so the pill
 spawns `engine.py` itself (in its own GUI/TCC context, where the mic permission

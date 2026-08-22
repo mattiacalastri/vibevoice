@@ -27,8 +27,33 @@ import engine
 
 # The pill (vibevoice.py) reads levels.bin with a hard-coded `struct.unpack("<60f", ...)`.
 # That magic number lives on the reader side; this is the single source that must agree.
+# `test_the_pill_really_unpacks_that_many_floats` checks this against the pill's
+# own source, so the literal below cannot drift away from the reader unnoticed.
 PILL_LEVELS_FORMAT = "<60f"
 PILL_LEVELS_BYTES = 60 * 4
+
+
+def _assert_only_swapped_in(live_path, write, seed=b"x"):
+    """Run `write` twice and require that `live_path` was REPLACED, not rewritten.
+
+    A writer that truncates the live file in place has a window in which a reader
+    sees an empty or half-written file. Asserting "no tmp left behind" does not
+    catch it — a direct write leaves no tmp either, because it never made one.
+
+    The tell is the inode: `os.replace` swaps a different file into the name, so
+    the inode changes; `write_text` reuses the same one. Asked of the filesystem
+    rather than by patching `pathlib.Path` — patching the class reaches every
+    thread in the process, and doing so took the suite from 13 s to over ten
+    minutes (2026-08-06). A test must not cost more than the bug it guards.
+    """
+    live_path.write_bytes(seed)
+    before = live_path.stat().st_ino
+    write()
+    after = live_path.stat().st_ino
+    assert before != after, (
+        f"{live_path.name} kept its inode — it was written in place, "
+        "leaving a window where the pill reads a torn file"
+    )
 
 
 # ── levels.bin: the binary heartbeat (invariant #2) ───────────────────────────
@@ -141,6 +166,35 @@ def test_pre_roll_keeps_half_a_second_of_audio():
 def test_levels_len_matches_pill_magic():
     """Cross-side guard: the pill hard-codes 60; the engine must agree."""
     assert engine.LEVELS_LEN == 60
+
+
+def test_the_pill_really_unpacks_that_many_floats():
+    """Read the number out of the PILL, not out of this file.
+
+    The guard above never opens vibevoice.py: it compares the engine against a
+    `60` typed here. Change the pill to `struct.unpack("<48f", ...)` and both
+    stay green while the VU bars read garbage — the writer and the reader
+    disagreeing is the one thing the state-file contract exists to prevent.
+    So parse every width the pill actually uses and require them all to match.
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "vibevoice.py").read_text()
+    widths = {int(n) for n in re.findall(r'struct\.unpack\(\s*"<(\d+)f"', src)}
+    assert widths, "no struct.unpack of levels found in the pill — did it move?"
+    assert widths == {engine.LEVELS_LEN}, (
+        f"the pill unpacks {sorted(widths)} floats, the engine writes "
+        f"{engine.LEVELS_LEN}"
+    )
+
+    # The length check guarding those unpacks must agree too: `len(data) < 60*4`
+    # with a 48-float unpack would accept a short frame and read past it.
+    guards = {int(n) for n in re.findall(r"len\(data\)\s*<\s*(\d+)\s*\*\s*4", src)}
+    assert not guards - {engine.LEVELS_LEN}, (
+        f"the pill guards on {sorted(guards)} samples, the engine writes "
+        f"{engine.LEVELS_LEN}"
+    )
 
 
 # ── state / raw text files ────────────────────────────────────────────────────
@@ -1227,6 +1281,28 @@ def test_partial_write_is_atomic(engine_state):
     """Written via tmp + os.replace: the pill never sees a torn sentence."""
     engine.write_partial("una frase intera")
     assert not engine.PARTIAL_TMP.exists()
+
+
+def test_partial_is_never_written_straight_onto_the_live_file(engine_state):
+    """"No tmp left behind" is also true of a plain `write_text` — which leaves
+    no tmp because it never made one.
+
+    Verified 2026-08-06: swap `write_partial` for a direct truncate-in-place and
+    the assertion above still passes. So watch the mechanism instead — the live
+    file must only ever appear via os.replace, because the pill reads it on a
+    timer and a truncate window is exactly when it would catch half a sentence.
+    """
+    _assert_only_swapped_in(engine.PARTIAL_FILE,
+                            lambda: engine.write_partial("una frase intera"))
+
+
+def test_levels_are_never_written_straight_onto_the_live_file(engine_state):
+    """Same guard for the binary heartbeat: the pill unpacks it 60 floats at a
+    time and a partial file is a torn frame."""
+    from collections import deque
+    _assert_only_swapped_in(
+        engine.LEVELS_FILE,
+        lambda: engine.write_levels(deque([0.1] * engine.LEVELS_LEN)))
 
 
 def test_clear_partial_removes_the_file(engine_state):

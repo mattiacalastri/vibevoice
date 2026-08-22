@@ -298,6 +298,27 @@ def clear_partial() -> None:
         pass
 
 
+# The three JSONL ledgers below are read-modify-written: read every line, append
+# one, write the lot back capped. `write_text` truncates before it writes, so the
+# file is empty for the length of that write — and the pill kills the engine with
+# `pkill` on every restart and every engine-visible settings change. Landing in
+# that window truncates the ledger for good; corpus.jsonl is a learning corpus
+# that nothing can reconstruct. levels.bin and partial.txt were already written
+# tmp + os.replace 60 lines up — the durable files were the ones left exposed.
+#
+# The lock closes the second half of the same hole: up to two transcriptions are
+# in flight (invariant #4), and two workers doing read-modify-write on one file
+# lose an entry to each other regardless of how the write lands.
+_LEDGER_LOCK = threading.Lock()
+
+
+def _write_lines_atomic(path: Path, lines: list) -> None:
+    """Replace `path` with `lines` atomically. Caller holds _LEDGER_LOCK."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
 def _patch_last_metrics(fields: dict) -> None:
     """Merge `fields` into the newest metrics line.
 
@@ -308,13 +329,14 @@ def _patch_last_metrics(fields: dict) -> None:
     """
     try:
         import json
-        lines = METRICS_FILE.read_text().splitlines()
-        if not lines:
-            return
-        entry = json.loads(lines[-1])
-        entry.update(fields)
-        lines[-1] = json.dumps(entry)
-        METRICS_FILE.write_text("\n".join(lines) + "\n")
+        with _LEDGER_LOCK:
+            lines = METRICS_FILE.read_text().splitlines()
+            if not lines:
+                return
+            entry = json.loads(lines[-1])
+            entry.update(fields)
+            lines[-1] = json.dumps(entry)
+            _write_lines_atomic(METRICS_FILE, lines)
     except Exception:
         pass
 
@@ -369,13 +391,16 @@ def _append_history(text: str) -> None:
     try:
         import json
         import time
-        lines = []
-        try:
-            lines = HISTORY_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps({"ts": time.time(), "text": text}))
-        HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+        # Read and write under one lock: two workers that both read, then both
+        # write, keep only the second one's entry.
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = HISTORY_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps({"ts": time.time(), "text": text}))
+            _write_lines_atomic(HISTORY_FILE, lines[-HISTORY_MAX:])
     except Exception:
         pass
 
@@ -388,13 +413,14 @@ def _append_corpus(text: str) -> None:
     """
     try:
         import json
-        lines = []
-        try:
-            lines = CORPUS_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False))
-        CORPUS_FILE.write_text("\n".join(lines[-CORPUS_MAX:]) + "\n")
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = CORPUS_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False))
+            _write_lines_atomic(CORPUS_FILE, lines[-CORPUS_MAX:])
     except Exception:
         pass
 
@@ -408,13 +434,14 @@ def _append_metrics(entry: dict) -> None:
     """
     try:
         import json
-        lines = []
-        try:
-            lines = METRICS_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps(entry))
-        METRICS_FILE.write_text("\n".join(lines[-METRICS_MAX:]) + "\n")
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = METRICS_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps(entry))
+            _write_lines_atomic(METRICS_FILE, lines[-METRICS_MAX:])
     except Exception:
         pass
 
