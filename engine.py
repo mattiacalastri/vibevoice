@@ -171,15 +171,15 @@ SILERO_OFFSET = 0.35    # probability that turns it OFF (hysteresis low; in betw
 SILERO_FRAME = 512      # samples per Silero inference frame at 16 kHz (model contract)
 SILERO_CONTEXT = 64     # context samples prepended to each frame (v5 ONNX contract)
 SILERO_QUEUE_MAX = 32   # submit()→worker backlog cap; beyond this, blocks are dropped
-SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing silence that ends an utterance (lower = faster paste, but a mid-sentence pause splits the utterance)
+SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "0.8"))  # trailing silence that ends an utterance (lower = faster paste, but a mid-sentence pause splits the utterance)
 # Streaming (F3): re-decode the open utterance while it is still being spoken so
 # text exists BEFORE the trailing silence expires. Without it the first word can
 # only appear SILENCE_SEC after you stop talking — that wait is the architecture,
 # not a tunable. The partial pass is a bonus: any failure leaves the final,
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
-PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
-PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.45"))  # cadence before the first word reaches the app
+PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.22"))  # min seconds between partial passes
+PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.15"))  # cadence before the first word reaches the app
 
 
 def partial_interval(has_delivered: bool) -> float:
@@ -236,7 +236,7 @@ MAX_DUR = 15.0          # force finalize after this many seconds (short enough t
 PRE_ROLL_BLOCKS = 10    # blocks kept before speech onset — a DURATION (0.5s at
                         # BLOCKSIZE=800), and it is what saves the first syllable
 
-RETURN_DELAY = 1.5      # seconds between paste and Return keypress
+RETURN_DELAY = float(os.environ.get("VIBEVOICE_RETURN_DELAY", "0.7"))  # paste → Return
 
 
 # ── State file writers (engine is the sole writer) ───────────────────────────
@@ -935,6 +935,22 @@ def _press_key_cg(key_code: int, with_command: bool = False) -> bool:
 _TYPE_CHUNK = 16   # CGEventKeyboardSetUnicodeString is unreliable past ~20 UTF-16 units
 
 
+def paste_chunk(text: str) -> bool:
+    """Deliver `text` through the clipboard — the only channel Chromium honours.
+
+    Used for the STREAMING path on Electron apps. It costs the pasteboard (a
+    handful of overwrites per utterance), but the alternative measured worse:
+    unicode keystrokes are dropped there, so the words never arrived at all and
+    the engine still counted them as delivered.
+    """
+    import subprocess
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=3)
+    except Exception:
+        return False
+    return _press_key_cg(9, with_command=True)  # Cmd+V
+
+
 def type_text(text: str) -> bool:
     """Type `text` into the frontmost app as synthetic keystrokes.
 
@@ -945,6 +961,9 @@ def type_text(text: str) -> bool:
     characters directly, at the same HID tap as the Cmd+V path, so it reaches
     sandboxed Electron editors too. Returns False if Quartz is unavailable.
     """
+    if not stream_paste_supported():
+        return paste_chunk(text)
+
     if not text:
         return True
     try:
@@ -977,6 +996,48 @@ def type_text(text: str) -> bool:
 
 
 _ANCHOR_LEN = 3   # words of context that make a match trustworthy
+
+
+# ── Streaming-paste eligibility (Chromium/Electron drop unicode keystrokes) ───
+# `type_text` posts CGEventKeyboardSetUnicodeString with key code 0. AppKit apps
+# honour it; Chromium-based ones (Antigravity IDE, VS Code, Slack…) read the key
+# code and drop the payload. The engine still marked those words as streamed, so
+# the finalize paste only shipped the tail and the rest was lost in silence.
+# Where the stream cannot land, we skip it: the clipboard paste at finalize is
+# the one channel Chromium honours, and it then carries the whole utterance.
+STREAM_PASTE_DENY = tuple(
+    x.strip().lower()
+    for x in os.environ.get(
+        "VIBEVOICE_STREAM_PASTE_DENY",
+        "antigravity,vscode,electron,code,slack,discord,notion,obsidian,chrome",
+    ).split(",")
+    if x.strip()
+)
+_FRONT_CACHE = {"t": 0.0, "bid": ""}
+
+
+def frontmost_bundle_id() -> str:
+    """Bundle id of the frontmost app, cached for 1s (a partial pass runs often)."""
+    now = time.monotonic()
+    if now - _FRONT_CACHE["t"] < 1.0:
+        return _FRONT_CACHE["bid"]
+    bid = ""
+    try:
+        from AppKit import NSWorkspace
+        info = NSWorkspace.sharedWorkspace().activeApplication() or {}
+        bid = (info.get("NSApplicationBundleIdentifier") or "").lower()
+    except Exception:
+        bid = ""
+    _FRONT_CACHE.update(t=now, bid=bid)
+    return bid
+
+
+def stream_paste_supported() -> bool:
+    """False when the frontmost app is known to drop synthetic unicode keystrokes."""
+    bid = frontmost_bundle_id()
+    if not bid:
+        return True  # unknown app: keep the fast path, finalize still repairs
+    return not any(token in bid for token in STREAM_PASTE_DENY)
 
 
 def unstreamed_tail(streamed: str, final: str) -> str:

@@ -76,6 +76,9 @@ AUTO_SEND_DELAY = 0.8  # seconds of typing silence -> auto Return
 TARGET_APPS = {
     "Terminal", "iTerm2", "iTerm", "Hyper", "Warp", "Ghostty",
     "Electron", "Code",
+    # Antigravity reports "Antigravity IDE" to NSWorkspace and matched nothing,
+    # so dictation into it never got its Return.
+    "Antigravity",
 }
 
 STATE_DIR = Path(os.path.expanduser("~/.vibevoice"))
