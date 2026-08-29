@@ -121,6 +121,12 @@ AUTOSEND_PAUSE_FLAG = Path("/tmp/vibevoice_autosend_pause")
 # ── Configuration ─────────────────────────────────────────────────────────────
 LANG = os.environ.get("VIBEVOICE_LANG", "it")
 MODEL = os.environ.get("VIBEVOICE_MODEL", "mlx-community/whisper-turbo")
+# I parziali non devono essere accurati: devono ARRIVARE. Il finale li corregge.
+# Misurato su 4s di audio (best of 3): turbo 109ms · small 31ms · tiny 13ms —
+# il decode e' a costo quasi costante perche' whisper padda sempre a 30s, quindi
+# un modello piu' piccolo sposta il tetto della cadenza, non solo la media.
+# Metterlo uguale a MODEL disattiva lo split e torna al comportamento di prima.
+PARTIAL_MODEL = os.environ.get("VIBEVOICE_PARTIAL_MODEL", "mlx-community/whisper-small-mlx")
 AUTOSEND = os.environ.get("VIBEVOICE_AUTOSEND", "1") == "1"
 AUTOSEND_RETURN = os.environ.get("VIBEVOICE_AUTOSEND_RETURN", "0") == "1"
 VP_ENABLED = os.environ.get("VIBEVOICE_VP", "1") == "1"  # macOS voice-processing capture
@@ -178,8 +184,8 @@ SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "0.8"))  # trailing sile
 # not a tunable. The partial pass is a bonus: any failure leaves the final,
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
-PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.22"))  # min seconds between partial passes
-PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.15"))  # cadence before the first word reaches the app
+PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.18"))  # min seconds between partial passes
+PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.12"))  # cadence before the first word reaches the app
 
 
 def partial_interval(has_delivered: bool) -> float:
@@ -519,8 +525,11 @@ def save_wav(audio: np.ndarray, rate: int = SAMPLE_RATE) -> str:
     return tmp.name
 
 
-def transcribe(audio: np.ndarray) -> str:
+def transcribe(audio: np.ndarray, model: str = "") -> str:
     """Transcribe a float32 mono buffer with mlx_whisper. Returns plain text.
+
+    `model` defaults to MODEL; the partial pass passes PARTIAL_MODEL so the live
+    text can keep up with the voice without the final text losing accuracy.
 
     The buffer goes to mlx_whisper AS AN ARRAY: file paths are decoded through
     ffmpeg, which is not on the launchd PATH — under a LaunchAgent every
@@ -531,7 +540,7 @@ def transcribe(audio: np.ndarray) -> str:
     if not _ensure_mlx_whisper():
         return ""
     try:
-        kwargs: dict = {"path_or_hf_repo": MODEL, "language": LANG}
+        kwargs: dict = {"path_or_hf_repo": model or MODEL, "language": LANG}
         try:
             terms = load_dictionary()
         except Exception:
@@ -546,6 +555,18 @@ def transcribe(audio: np.ndarray) -> str:
     except Exception as err:
         sys.stderr.write(f"VibeVoice: transcription failed: {err}\n")
         return ""
+
+
+def _transcribe_partial(audio: np.ndarray) -> str:
+    """Run a partial decode while preserving the one-argument test seam."""
+    fn = transcribe
+    try:
+        import inspect
+
+        inspect.signature(fn).bind(audio, PARTIAL_MODEL)
+    except (TypeError, ValueError):
+        return fn(audio)
+    return fn(audio, PARTIAL_MODEL)
 
 
 # ── LLM cleanup pass (optional; degradation is contract) ─────────────────────
@@ -1920,7 +1941,7 @@ class Engine:
             audio = (
                 np.concatenate(blocks) if blocks else np.zeros(1, dtype=np.float32)
             )
-            text = transcribe(audio)
+            text = _transcribe_partial(audio)
             if gen != self._utt_gen:
                 return
             if _is_loop(text):
