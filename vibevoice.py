@@ -116,6 +116,10 @@ from AppKit import (
     NSString, NSPasteboard, NSPasteboardTypeString,
     NSStatusBar, NSMenuItem, NSVariableStatusItemLength,
     NSWindow, NSTextField, NSButton, NSPopUpButton, NSTextView, NSScrollView,
+    NSVisualEffectView, NSWindowStyleMaskFullSizeContentView,
+    NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectStateFollowsWindowActiveState,
+    NSAppearance, NSAppearanceNameDarkAqua,
 )
 from Foundation import NSObject, NSMakeSize, NSBundle
 
@@ -1475,26 +1479,45 @@ class Controller(NSObject):
                 ("section", "BEHAVIOUR"), ("autosend", None), ("autosend_return", None),
                 ("section", "APPEARANCE"), ("dock", None),
                 ("section", "HISTORY")]
-        H = 40 + 26 * sum(1 for k, _ in rows if k != "section") \
+        H = 64 + 26 * sum(1 for k, _ in rows if k != "section") \
             + 30 * sum(1 for k, _ in rows if k == "section") + 160
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H),
-            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+            | NSWindowStyleMaskFullSizeContentView,
             NSBackingStoreBuffered, False)
         win.setTitle_("VibeVoice — Settings")
         win.setMinSize_(NSMakeSize(W, self._SET_MIN_H))
         win.center()
         win.setReleasedWhenClosed_(False)
-        v = win.contentView()
-        y = [H - 12]                       # a cell, so the closures below can move it
+        # Liquid glass: the window IS the material. Behind-window vibrancy under a
+        # transparent titlebar; controls sit on the glass, the history keeps its own
+        # opaque-ish layer below (a dense reading surface must not be glass). The
+        # "Reduce transparency" fallback is the system's own: NSVisualEffectView
+        # goes opaque by itself. Dark is pinned on purpose — this is the Matrix
+        # pill's chrome, one committed look, no light-mode contrast roulette.
+        win.setTitlebarAppearsTransparent_(True)
+        win.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
+        glass = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+        glass.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        glass.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        glass.setState_(NSVisualEffectStateFollowsWindowActiveState)
+        glass.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        win.setContentView_(glass)
+        v = glass
+        y = [H - 36]                       # a cell, so the closures below can move it
+        # (content now extends under the titlebar: start 24pt lower to clear it)
 
         def _section(title):
             y[0] -= 30
             lbl = NSTextField.labelWithString_(title)
             lbl.setFrame_(NSMakeRect(20, y[0], W - 40, 18))
             lbl.setFont_(NSFont.boldSystemFontOfSize_(10))
-            lbl.setTextColor_(NSColor.secondaryLabelColor())
+            # The one color the glass carries: the pill's own Matrix green (§MATRIX),
+            # dimmed to a label. Everything else stays semantic/vibrant.
+            lbl.setTextColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.12, 1.0, 0.32, 0.85))
             v.addSubview_(lbl)
 
         def _row(label):
@@ -1545,6 +1568,17 @@ class Controller(NSObject):
             NSMakeRect(20, y[0] - hist_h, W - 40, hist_h))
         tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, hist_h))
         tv.setEditable_(False)
+        # Content layer, not glass: dense text gets a dim solid berth and full-
+        # contrast type, per the material's own rulebook.
+        sc.setBorderType_(0)               # NSNoBorder
+        sc.setDrawsBackground_(False)
+        sc.setWantsLayer_(True)
+        sc.layer().setCornerRadius_(10.0)
+        sc.layer().setMasksToBounds_(True)
+        tv.setDrawsBackground_(True)
+        tv.setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.35))
+        tv.setTextColor_(NSColor.labelColor())
+        tv.setTextContainerInset_(NSMakeSize(8, 8))
         sc.setDocumentView_(tv)
         sc.setHasVerticalScroller_(True)
         # The history is the only thing worth growing when the window is resized.
