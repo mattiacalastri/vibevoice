@@ -48,22 +48,44 @@ echo "── verify ──"
 codesign --verify --strict --deep "$APP" && echo "codesign: OK"
 spctl -a -vv "$APP" 2>&1 | tail -2 || echo "(spctl rejection is EXPECTED before notarization)"
 
-echo "── dmg ──"
-rm -f "$DMG"
-STAGE="$(mktemp -d -t vibevoice-dmg)"
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname "VibeVoice" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-rm -rf "$STAGE"
-codesign --force --timestamp --sign "$IDENTITY" "$DMG"
-du -sh "$DMG"
+# Built twice on purpose. The first DMG is the one that goes to Apple; the app
+# inside it cannot carry a ticket yet, because the ticket does not exist until
+# Apple has looked at it. Shipping THAT one leaves every user with an unstapled
+# app: it opens while they have a network (Gatekeeper fetches the ticket) and
+# fails the day they do not. So after stapling, the DMG is rebuilt around the
+# now-stapled app and stapled itself — the ticket is already issued, `stapler`
+# just fetches it again.
+make_dmg() {
+  rm -f "$DMG"
+  STAGE="$(mktemp -d -t vibevoice-dmg)"
+  cp -R "$APP" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"
+  hdiutil create -volname "VibeVoice" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+  rm -rf "$STAGE"
+  codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+}
 
 echo "── notarize (best-effort) ──"
 if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
-  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  # TWO submissions, in this order, and the order is the whole point. A ticket is
+  # bound to the exact bytes it was issued for, so a DMG rebuilt after stapling is
+  # a file Apple has never seen: `stapler` answers "Record not found". The app must
+  # therefore be notarised and stapled BEFORE the DMG that carries it is built.
+  echo "── notarize the app itself ──"
+  APPZIP="$(mktemp -d)/App.zip"
+  ditto -c -k --keepParent "$APP" "$APPZIP"
+  xcrun notarytool submit "$APPZIP" --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple "$APP"
+  rm -f "$APPZIP"
+
+  echo "── dmg around the stapled app ──"
+  make_dmg
+  du -sh "$DMG"
+
+  echo "── notarize the dmg ──"
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple "$DMG"
-  echo "notarized + stapled"
+  echo "notarized + stapled (the app inside the dmg carries its own ticket)"
 else
   cat <<EOF
 notarytool profile '$NOTARY_PROFILE' not found — SKIPPING notarization.

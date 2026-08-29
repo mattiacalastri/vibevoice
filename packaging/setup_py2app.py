@@ -21,7 +21,7 @@ from setuptools import setup
 # when two copies of com.vibevoice.app exist on disk — keeping it in a single
 # constant is what stops the "installed app is older than the repo" question
 # from needing an archaeology session to answer.
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # modulegraph walks the AST of every scanned module recursively (no explicit
 # stack) — numpy's __init__ has deeply nested conditional imports that blow
