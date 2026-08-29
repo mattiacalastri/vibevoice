@@ -27,8 +27,33 @@ import engine
 
 # The pill (vibevoice.py) reads levels.bin with a hard-coded `struct.unpack("<60f", ...)`.
 # That magic number lives on the reader side; this is the single source that must agree.
+# `test_the_pill_really_unpacks_that_many_floats` checks this against the pill's
+# own source, so the literal below cannot drift away from the reader unnoticed.
 PILL_LEVELS_FORMAT = "<60f"
 PILL_LEVELS_BYTES = 60 * 4
+
+
+def _assert_only_swapped_in(live_path, write, seed=b"x"):
+    """Run `write` twice and require that `live_path` was REPLACED, not rewritten.
+
+    A writer that truncates the live file in place has a window in which a reader
+    sees an empty or half-written file. Asserting "no tmp left behind" does not
+    catch it — a direct write leaves no tmp either, because it never made one.
+
+    The tell is the inode: `os.replace` swaps a different file into the name, so
+    the inode changes; `write_text` reuses the same one. Asked of the filesystem
+    rather than by patching `pathlib.Path` — patching the class reaches every
+    thread in the process, and doing so took the suite from 13 s to over ten
+    minutes (2026-08-06). A test must not cost more than the bug it guards.
+    """
+    live_path.write_bytes(seed)
+    before = live_path.stat().st_ino
+    write()
+    after = live_path.stat().st_ino
+    assert before != after, (
+        f"{live_path.name} kept its inode — it was written in place, "
+        "leaving a window where the pill reads a torn file"
+    )
 
 
 # ── levels.bin: the binary heartbeat (invariant #2) ───────────────────────────
@@ -141,6 +166,35 @@ def test_pre_roll_keeps_half_a_second_of_audio():
 def test_levels_len_matches_pill_magic():
     """Cross-side guard: the pill hard-codes 60; the engine must agree."""
     assert engine.LEVELS_LEN == 60
+
+
+def test_the_pill_really_unpacks_that_many_floats():
+    """Read the number out of the PILL, not out of this file.
+
+    The guard above never opens vibevoice.py: it compares the engine against a
+    `60` typed here. Change the pill to `struct.unpack("<48f", ...)` and both
+    stay green while the VU bars read garbage — the writer and the reader
+    disagreeing is the one thing the state-file contract exists to prevent.
+    So parse every width the pill actually uses and require them all to match.
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "vibevoice.py").read_text()
+    widths = {int(n) for n in re.findall(r'struct\.unpack\(\s*"<(\d+)f"', src)}
+    assert widths, "no struct.unpack of levels found in the pill — did it move?"
+    assert widths == {engine.LEVELS_LEN}, (
+        f"the pill unpacks {sorted(widths)} floats, the engine writes "
+        f"{engine.LEVELS_LEN}"
+    )
+
+    # The length check guarding those unpacks must agree too: `len(data) < 60*4`
+    # with a 48-float unpack would accept a short frame and read past it.
+    guards = {int(n) for n in re.findall(r"len\(data\)\s*<\s*(\d+)\s*\*\s*4", src)}
+    assert not guards - {engine.LEVELS_LEN}, (
+        f"the pill guards on {sorted(guards)} samples, the engine writes "
+        f"{engine.LEVELS_LEN}"
+    )
 
 
 # ── state / raw text files ────────────────────────────────────────────────────
@@ -1229,6 +1283,28 @@ def test_partial_write_is_atomic(engine_state):
     assert not engine.PARTIAL_TMP.exists()
 
 
+def test_partial_is_never_written_straight_onto_the_live_file(engine_state):
+    """"No tmp left behind" is also true of a plain `write_text` — which leaves
+    no tmp because it never made one.
+
+    Verified 2026-08-06: swap `write_partial` for a direct truncate-in-place and
+    the assertion above still passes. So watch the mechanism instead — the live
+    file must only ever appear via os.replace, because the pill reads it on a
+    timer and a truncate window is exactly when it would catch half a sentence.
+    """
+    _assert_only_swapped_in(engine.PARTIAL_FILE,
+                            lambda: engine.write_partial("una frase intera"))
+
+
+def test_levels_are_never_written_straight_onto_the_live_file(engine_state):
+    """Same guard for the binary heartbeat: the pill unpacks it 60 floats at a
+    time and a partial file is a torn frame."""
+    from collections import deque
+    _assert_only_swapped_in(
+        engine.LEVELS_FILE,
+        lambda: engine.write_levels(deque([0.1] * engine.LEVELS_LEN)))
+
+
 def test_clear_partial_removes_the_file(engine_state):
     """No file = nothing live to show. Absence is the 'no partial' signal."""
     engine.write_partial("qualcosa")
@@ -1352,6 +1428,244 @@ def test_streaming_off_behaves_exactly_like_the_legacy_engine(engine_state, monk
 
     assert eng._speaking is True
     assert not engine.PARTIAL_FILE.exists()
+
+
+# ── Time to the first character: the number the product is sold on ───────────
+# Everything above proves the streaming path is WIRED. None of it proves it is
+# FAST, because every one of those tests sets PARTIAL_INTERVAL to 0 and skips
+# the cadence policy entirely — which is exactly how a 1.4 s wait survived 190
+# green tests. These tests measure the wait instead.
+
+_MEASURED_DECODE_S = 0.17      # one partial pass, M5 Max / whisper-turbo (AGENTS.md);
+                               # flat in buffer length — Whisper pads to 30 s anyway
+
+# What whisper-turbo ACTUALLY returns for the smoke sentence, buffer length by
+# buffer length, recorded 2026-08-03 by decoding each prefix once (pre-roll
+# included, exactly as the engine assembles it). Verbatim and not a rate model:
+# the first attempt here assumed words arrive at a steady 3/s, which flattered
+# short buffers and predicted a win the live tool then refuted. Whisper on a
+# sliver of speech does not return fewer words — it returns WRONG ones, and it
+# keeps changing its mind ("Il Polo" → "Il Poltino" → "Il polpo"). That churn is
+# the whole reason LocalAgreement needs two passes, so a model that smooths it
+# away cannot be used to reason about latency.
+_HEARD_AT: dict[float, str] = {
+    0.05: "Grazie a tutti.",          # the hallucination on near-silence, verbatim
+    0.10: "Is",
+    0.15: "E",
+    0.20: "E ba ba ba ba ba ba ba ba",
+    0.25: "Il po'",
+    0.30: "Il Polo",
+    0.35: "Il Poltino",
+    0.40: "Il polpo",
+    0.45: "Il polpo è",
+    0.50: "Il polpo a",
+    0.55: "Il polpo a ove.",
+    0.60: "Il Polpo è",
+    0.65: "Il Polpo è ottenuto.",
+    0.70: "Il polpo è 8.",
+    0.75: "Il polpo è 8.",
+    0.80: "Il polpo è 8 tessere.",
+    0.85: "Il polpo a 8 tess.",
+    0.90: "Il polpo a 8 tenei.",
+    0.95: "Il polpo a 8 tentative.",
+    1.00: "Il polpo a 8 tentativi.",
+    1.05: "Il polpo a 8 tentacoli.",
+    1.10: "Il polpo a 8 tentacoli.",
+    1.15: "Il polpo a 8 tentacoli.",
+    1.20: "Il polpo a 8 tentacoli.",
+}
+
+
+def _heard_after(t: float) -> str:
+    """The recognizer's answer for a buffer holding `t` seconds of speech."""
+    grid = min(_HEARD_AT, key=lambda g: abs(g - t))
+    return _HEARD_AT[grid] if t <= max(_HEARD_AT) else _HEARD_AT[max(_HEARD_AT)]
+
+
+def _seconds_to_first_typed_character(
+    *,
+    decode_s: float = _MEASURED_DECODE_S,
+    horizon: float = 8.0,
+) -> float | None:
+    """Replay the streaming scheduler on a fake clock; return when the app would
+    receive its first character, in seconds after speech onset.
+
+    A model, and it says so — but every part of it that could lie is real. It
+    runs the **real** `engine.partial_interval` and the **real**
+    `engine.LocalAgreement` over the **recorded** answers of the real
+    recognizer, and it mirrors the three rules the audio callback follows: one
+    decode slot, the timer resetting on dispatch whether or not the slot was
+    free, and the one-word lag before anything is typed.
+
+    Calibrated against the live tool, not asserted into existence — see
+    `test_the_scheduler_model_reproduces_the_measured_baselines`.
+    """
+    agree = engine.LocalAgreement()
+    block_s = engine.BLOCKSIZE / engine.SAMPLE_RATE
+    t = 0.0
+    t_partial = 0.0             # the engine seeds this at utterance onset
+    in_flight: tuple[float, str] | None = None
+
+    while t < horizon:
+        if in_flight is not None and t >= in_flight[0]:
+            agree.update(in_flight[1])
+            in_flight = None
+            # The stream types the confirmed prefix minus its last word, so two
+            # confirmed words are what it takes to put one on screen.
+            if len(agree.confirmed.split()) >= 2:
+                return round(t, 3)
+        if t - t_partial >= engine.partial_interval(len(agree.confirmed.split()) >= 2):
+            t_partial = t
+            if in_flight is None:
+                in_flight = (t + decode_s, _heard_after(t))
+        t += block_s
+    return None
+
+
+def test_the_scheduler_model_reproduces_the_measured_baselines(monkeypatch):
+    """The model is only worth its assertions if it agrees with the real thing.
+
+    `tools/smoke_streaming.py` — real audio, real Whisper, wall clock — was run
+    interleaved on both cadences, three times each on 2026-08-03: the flat 0.6 s
+    schedule put the first character at 1.4 s every single time, and the 0.45 s
+    warm-up at 1.0/1.1/1.1 s. The model must land on both. If this ever drifts,
+    the budget below is measuring a fiction and must not be trusted until the
+    model is re-recorded against the tool.
+    """
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", engine.PARTIAL_INTERVAL)  # the old flat cadence
+    flat = _seconds_to_first_typed_character()
+    assert flat is not None and abs(flat - 1.4) <= 0.05, (
+        f"model says {flat}s where the live tool measured 1.4s flat — re-record it"
+    )
+
+    monkeypatch.undo()
+    warmed = _seconds_to_first_typed_character()
+    assert warmed is not None and abs(warmed - 1.05) <= 0.10, (
+        f"model says {warmed}s where the live tool measured 1.0–1.1s — re-record it"
+    )
+
+
+def test_the_first_character_arrives_a_third_of_a_second_sooner():
+    """The product claim, as a number.
+
+    The competitor transcribes while you talk; this engine made you wait 1.4 s
+    for the first character on a clean synthetic sentence — and a p50 of 2.31 s
+    on the real dictation ledger. The wait is not the decode (170 ms): it is
+    `2 × cadence`, because LocalAgreement-2 publishes nothing until two passes
+    have agreed. Moving the first pass earlier — without adding passes, which
+    measurement showed makes it worse — is what buys the difference between text
+    that follows the voice and text that trails it.
+    """
+    first = _seconds_to_first_typed_character()
+
+    assert first is not None, "no character was ever typed within the horizon"
+    assert first <= 1.15, f"first character at {first}s — the wait is back"
+
+
+def test_the_warmup_does_not_buy_the_first_character_with_more_passes(monkeypatch):
+    """The scar of this fix, kept executable.
+
+    The obvious move — decode far more often while the line is empty — was tried
+    and measured, and it lost: 1.1–2.1 s live against a steady 1.4 s. A cadence
+    below the decode cost plus its jitter loses whole turns (the timer resets on
+    dispatch, free slot or not), and agreement needs *consecutive* hypotheses.
+    So the warm-up must stay comfortably above one decode. Whoever tunes this
+    down next should have to delete this test on purpose.
+    """
+    assert engine.PARTIAL_WARMUP >= 2 * _MEASURED_DECODE_S, (
+        f"a {engine.PARTIAL_WARMUP}s warm-up leaves under "
+        f"{engine.PARTIAL_WARMUP - _MEASURED_DECODE_S:.2f}s of slack on a "
+        f"{_MEASURED_DECODE_S}s decode — jitter will eat the turns"
+    )
+
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.25)
+    assert _seconds_to_first_typed_character() is not None
+
+
+def test_the_cadence_is_tighter_only_until_the_first_word_is_confirmed():
+    """Two regimes, one knob. Spending passes is cheap while the line is empty
+    and wasteful once text is flowing — where extra passes buy only freshness
+    and add pressure on the paste queue, which the ledger already blames for 58
+    stood-down turns out of 113."""
+    assert engine.partial_interval(False) == engine.PARTIAL_WARMUP
+    assert engine.partial_interval(True) == engine.PARTIAL_INTERVAL
+    assert engine.PARTIAL_WARMUP < engine.PARTIAL_INTERVAL, (
+        "a warm-up at or above the steady cadence is the old behaviour wearing a new name"
+    )
+
+
+def test_the_warmup_can_only_make_the_engine_more_eager(monkeypatch):
+    """A floor, not a second cadence. Someone who asks for passes every 0.1 s
+    everywhere must not get a 0.25 s wait for the word they are waiting on."""
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 0.1)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.25)
+
+    assert engine.partial_interval(False) == 0.1
+
+
+def test_the_engine_leaves_the_warmup_cadence_once_a_word_reaches_the_app(
+    engine_state, monkeypatch
+):
+    """The policy has to be the one the audio thread actually consults.
+
+    A pure function nobody calls is the classic way for this fix to rot. So:
+    make the two regimes impossible to confuse — warm-up fires on every block,
+    steady fires never — and count the passes. Two passes are what
+    LocalAgreement needs to confirm anything; the third block must find the
+    engine already back on the steady cadence and stay silent.
+    """
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.0)      # always due
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 10.0)   # never due
+
+    # Hypotheses chosen so that "confirmed" and "delivered" happen on DIFFERENT
+    # passes — otherwise the test cannot tell the two apart, and a version that
+    # ends the warm-up one pass early passes it just as happily. (It did: the
+    # mutation check called that out before this file was committed.)
+    #   pass 1  "il polpo"       → nothing yet, no previous hypothesis
+    #   pass 2  "il gatto"       → agrees on "il" alone: confirmed, but the
+    #                              one-word lag means the app still has nothing
+    #   pass 3  "il gatto nero"  → "gatto" agrees too: now a word comes free
+    hypotheses = iter(["il polpo", "il gatto", "il gatto nero"])
+    monkeypatch.setattr(engine, "transcribe",
+                        lambda audio: next(hypotheses, "il gatto nero"))
+
+    eng = engine.Engine()
+    for _ in range(4):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+
+    assert eng._has_delivered is True, "the third pass frees a word for the app"
+    assert eng._partials == 3, (
+        f"{eng._partials} passes: the warm-up ended on the CONFIRMED word instead "
+        "of the delivered one, so the fourth block found the steady cadence and "
+        "the user waits a full interval for a character that was one pass away"
+    )
+
+
+def test_a_new_utterance_starts_blind_again(engine_state, monkeypatch):
+    """The warm-up is per-utterance. If the flag survived the close, the second
+    sentence of a dictation would pay the full steady cadence for its first
+    word — and back-to-back utterances are the common case, not the edge."""
+    monkeypatch.setattr(engine, "STREAMING", True)
+    monkeypatch.setattr(engine, "PARTIAL_WARMUP", 0.0)
+    monkeypatch.setattr(engine, "PARTIAL_INTERVAL", 10.0)
+    monkeypatch.setattr(engine, "SILENCE_SEC", 0.0)
+    monkeypatch.setattr(engine, "transcribe", lambda audio: "il polpo ha")
+
+    eng = engine.Engine()
+    for _ in range(3):
+        eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+        _drain_partials(eng)
+    assert eng._has_delivered is True
+
+    # Silence closes the utterance, then speech opens the next one.
+    eng._audio_callback(_speech_block(0.0), engine.BLOCKSIZE, None, None)
+    eng._audio_callback(_speech_block(0.0), engine.BLOCKSIZE, None, None)
+    _drain_finals(eng)
+    eng._audio_callback(_speech_block(), engine.BLOCKSIZE, None, None)
+
+    assert eng._has_delivered is False, "the next sentence must start on the warm-up cadence"
 
 
 # ── Streaming paste: typing the confirmed words while the sentence is open ────

@@ -3,12 +3,25 @@
 """py2app build: python3 packaging/setup_py2app.py py2app (run from repo root).
 
 Fallback if py2app can't cope (document WHY in the commit):
-  pyinstaller --windowed --name VibeVoice --icon assets/icon/VibeVoice.icns vibevoice.py
+  pyinstaller --windowed --name VibeVoice --icon assets/icon/VibeVoice_LED.icns vibevoice.py
   then: check libportaudio via `otool -L` and graft with install_name_tool.
+
+This file is the ONLY place the shipped bundle's identity is declared — icon,
+name, version, usage strings. `packaging/install_dev_app.sh` reads the same
+OPTIONS through py2app's alias mode, so the daily driver and the release
+bundle cannot drift apart in what they claim to be (sess.9767: the release
+bundle was still shipping the retired teal waveform icon that BRAND.md forbids
+by name, and calling itself "Copyright not specified").
 """
 import sys
 
 from setuptools import setup
+
+# One string, two plist keys. CFBundleVersion is what LaunchServices compares
+# when two copies of com.vibevoice.app exist on disk — keeping it in a single
+# constant is what stops the "installed app is older than the repo" question
+# from needing an archaeology session to answer.
+VERSION = "1.0.0"
 
 # modulegraph walks the AST of every scanned module recursively (no explicit
 # stack) — numpy's __init__ has deeply nested conditional imports that blow
@@ -19,7 +32,12 @@ sys.setrecursionlimit(10000)
 APP = ["vibevoice.py"]
 DATA_FILES = ["engine.py", "autosend.py", "config.py", "requirements.txt"]
 OPTIONS = {
-    "iconfile": "assets/icon/VibeVoice.icns",
+    # The LED, not the waveform. `assets/icon/VibeVoice.icns` is the RETIRED
+    # teal wave — BRAND.md forbids both the wave ("names the category, not the
+    # product") and the teal (it is Astra Digital's colour, and this is not
+    # agency work). It stayed wired here for a month after the mark changed,
+    # so every bundle built in that window shipped the wrong logo.
+    "iconfile": "assets/icon/VibeVoice_LED.icns",
     # mlx_whisper is deliberately NOT in "packages": that option forces py2app
     # to recursively bundle the ENTIRE package tree, which for mlx_whisper
     # drags in transformers' optional torch/jax/onnxruntime/numba backends
@@ -63,8 +81,22 @@ OPTIONS = {
         "CFBundleName": "VibeVoice",
         "CFBundleDisplayName": "VibeVoice",
         "CFBundleIdentifier": "com.vibevoice.app",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
+        "CFBundleDevelopmentRegion": "en",
+        # py2app's default is the literal string "Copyright not specified",
+        # which is what the About box and the Finder inspector were showing on
+        # an MIT-licensed product that has a LICENSE file at its root.
+        "NSHumanReadableCopyright": "© 2026 Mattia Calastri — MIT licence",
+        # Finder, Launchpad and the App Store category shelf all read this; with
+        # it absent the app files under "Other".
+        "LSApplicationCategoryType": "public.app-category.productivity",
+        # Retina: without it AppKit renders the pill through the 1× path and
+        # every hairline in the UI lands on a half pixel.
+        "NSHighResolutionCapable": True,
+        # Two pills fight over ~/.vibevoice/ and over the microphone. A second
+        # double click should raise the running one, not start a rival.
+        "LSMultipleInstancesProhibited": True,
         "LSMinimumSystemVersion": "12.0",
         "LSUIElement": False,  # Dock ON by default; runtime policy follows config.json
         # A double-clicked app must LISTEN when you open it. The engine autostart

@@ -28,7 +28,7 @@ FAKE = pathlib.Path("/private/tmp/vv_smoke_home")
 (FAKE / ".vibevoice").mkdir(parents=True, exist_ok=True)
 os.environ["HOME"] = str(FAKE)
 
-sys.path.insert(0, "/Users/mattiacalastri/projects/vibevoice")
+sys.path.insert(0, "/Users/mattiacalastri/projects/💼-prodotti/vibevoice")
 
 # A history with one good line, one malformed, one empty: the good lines
 # must survive the others.

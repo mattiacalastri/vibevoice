@@ -50,7 +50,9 @@ land exactly where the cursor is — no clicks, no copy-paste dance.
 It's purpose-built for **live coding with Claude Code**: keep your hands on the
 keyboard, dictate the next instruction, and let VibeVoice drop it straight into
 the terminal (with an optional auto-Return so the prompt fires the moment you
-stop talking).
+stop talking). It also doubles as a compact teaching codebase: you can follow
+one utterance from microphone to state files to UI and typed prompt, then make
+a focused change and prove it with tests.
 
 <p align="center">
   <img src="docs/sequence.svg" alt="VibeVoice end to end: speak, VAD onset, record, silence, whisper, paste, optional Return" width="760">
@@ -70,6 +72,14 @@ device for vibe coding: **think out loud, ship.**
 
 > Born for **Claude Code**, but it pastes into *any* frontmost app — editor, chat
 > box, browser field. See [Two ways to fire the prompt](#two-ways-to-fire-the-prompt).
+
+## For students
+
+Start with the [student guide](STUDENT_GUIDE.md). It gives a clean virtualenv
+setup, a safe demo path with no microphone access, and a short sequence of
+Claude Code exercises. Read [`AGENTS.md`](AGENTS.md) before changing runtime
+code: it documents the process boundaries and state-file invariants that the
+tests protect.
 
 ## Features
 
@@ -304,7 +314,21 @@ keys and simulates Return).
 
 A LaunchAgent template is included as **[`com.vibevoice.pill.plist`](com.vibevoice.pill.plist)**
 (`RunAtLoad` + `KeepAlive`). It runs `python3 ~/projects/vibevoice/vibevoice.py`
-on login and keeps it alive.
+on login and restarts it if it **crashes**.
+
+Crash, not quit: `KeepAlive` is `{SuccessfulExit: false}`, not plain `true`.
+With `true`, launchd relaunches the pill whatever the exit code — which makes
+the menu's own **Quit (close everything)** a lie, since a clean quit exits 0 and
+comes straight back (with the engine behind it, when
+`VIBEVOICE_ENGINE_AUTOSTART=1`). The only escape is then `launchctl bootout`,
+which nobody should need to know. If you already installed a copy with
+`KeepAlive: true`, replace it and reload:
+
+```bash
+launchctl bootout gui/$UID/com.vibevoice.pill    # ignore "No such process"
+cp com.vibevoice.pill.plist ~/Library/LaunchAgents/   # re-edit the placeholders
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.vibevoice.pill.plist
+```
 
 **All-in-one:** the template sets `VIBEVOICE_ENGINE_AUTOSTART=1`, so the pill
 spawns `engine.py` itself (in its own GUI/TCC context, where the mic permission

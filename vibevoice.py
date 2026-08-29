@@ -88,6 +88,7 @@ import argparse
 import math
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -116,7 +117,7 @@ from AppKit import (
     NSStatusBar, NSMenuItem, NSVariableStatusItemLength,
     NSWindow, NSTextField, NSButton, NSPopUpButton, NSTextView, NSScrollView,
 )
-from Foundation import NSObject, NSMakeSize
+from Foundation import NSObject, NSMakeSize, NSBundle
 
 # ── state-file contract (under $HOME/.vibevoice) ──────────────────────────────
 STATE_DIR  = Path(os.path.expanduser("~/.vibevoice"))
@@ -296,7 +297,15 @@ VOICE_THRESH = 0.018    # raw RMS onset threshold (floor ~0.005 < thresh < speec
 
 FADE_STEP   = 0.18           # alpha per tick (fade in/out)
 IDLE_HIDE_S = 1.5            # seconds of silence before fade-out
-TICK        = 1.0 / 24.0     # ~24 fps
+TICK        = 1.0 / 60.0     # 60 fps — see IDLE_SKIP for the idle-time saving
+# 24 fps was the original cadence and it read as visibly stepped on the VU bars
+# (sess.9757): the bars are a continuous horizontal motion, the display runs at
+# 120 Hz, and every frame therefore held for five refreshes. Judder on smooth
+# translation is exactly what that produces. 60 fps halves the hold to two.
+IDLE_SKIP   = 8              # while HIDDEN, run 1 tick in 8 (~7.5 fps).
+# Kept as a DURATION, not a count: at 24 fps the old `% 3` meant ~125 ms of
+# worst-case onset latency, and 8/60 = 133 ms preserves it. Raising the frame
+# rate without raising this divisor would have quietly tripled idle CPU.
 
 MATRIX = (0.12, 1.00, 0.32)  # Matrix-terminal flúor green (#1fff52) — dictation
 AMBER  = (1.00, 0.66, 0.18)  # 🔒 locked / 🔁 auto-send armed
@@ -896,9 +905,32 @@ def _child_python():
     return sys.executable or "python3"
 
 
+def _argv_pattern(path) -> str:
+    """`path` as a pgrep/pkill pattern that matches itself and nothing else.
+
+    Both take an *extended regular expression*, not a literal — and a repo path
+    is user-chosen. Clone into `~/projects/vibe(voice)` and the raw path becomes
+    a regex with a capture group that matches nothing: pgrep returns 1, the pill
+    concludes its engine is dead, and every toggle spawns another one. Verified
+    against `(`, `+`, `[`, `*`, `^$`, a space and this repo's own emoji — all
+    seven fail raw and all seven pass escaped.
+    """
+    return re.escape(str(path))
+
+
 def _engine_running():
+    """True when OUR engine is alive — matched by absolute path, not by name.
+
+    `pgrep -f engine.py` matches any process with that string anywhere in argv:
+    an editor open on the file, a `tail -f`, an unrelated project's engine.py
+    (verified — a sleeping `python3 /tmp/.../engine.py` is a hit). Two failures
+    followed from it: the pill saw a stranger and refused to start its own
+    engine, and `_stop_engine`'s pkill killed that stranger. ENGINE_PATH is the
+    exact argv the pill spawns 40 lines down, so the match is now the process
+    we own — and it still ends in engine.py, keeping invariant #8 intact.
+    """
     try:
-        r = subprocess.run(["pgrep", "-f", "engine.py"],
+        r = subprocess.run(["pgrep", "-f", _argv_pattern(ENGINE_PATH)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode == 0
     except Exception:
@@ -990,16 +1022,20 @@ def apply_settings(cfg: dict) -> bool:
 
 
 def _stop_engine():
+    # Absolute path, for the reason spelled out in _engine_running: a bare
+    # `pkill -f engine.py` is a loaded gun pointed at every other process on the
+    # machine that happens to carry that string in argv.
     try:
-        subprocess.Popen(["pkill", "-f", "engine.py"],
+        subprocess.Popen(["pkill", "-f", _argv_pattern(ENGINE_PATH)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
 def _autosend_running():
+    # Same anchoring as _engine_running: a name is not an identity.
     try:
-        r = subprocess.run(["pgrep", "-f", "autosend.py"],
+        r = subprocess.run(["pgrep", "-f", _argv_pattern(AUTOSEND_PATH)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode == 0
     except Exception:
@@ -1737,14 +1773,14 @@ class Controller(NSObject):
         self.view.muted = _flag_on(MUTED_FILE)
         self.view.locked = _flag_on(LOCKED_FILE)
         engine_on = _engine_running()
-        # adaptive polling: while the pill is HIDDEN, work 1 tick in 3 (~8 fps)
-        # instead of 24 fps. Cuts idle CPU. Visible → full 24 fps. Onset latency
-        # ~125ms max. Compute the TTS-speaking slice once; if it speaks, don't
-        # idle-skip (smooth typewriter).
+        # adaptive polling: while the pill is HIDDEN, work 1 tick in IDLE_SKIP
+        # (~7.5 fps) instead of 60. Cuts idle CPU. Visible → full 60 fps. Onset
+        # latency ~133ms max. Compute the TTS-speaking slice once; if it speaks,
+        # don't idle-skip (smooth typewriter).
         tspk = "" if (self.demo or self.place) else self._tts_speaking()
         if (not self.demo and not self.place and not self.last_active
                 and not tspk and not self.view.locked):
-            self._idle_skip = (getattr(self, "_idle_skip", 0) + 1) % 3
+            self._idle_skip = (getattr(self, "_idle_skip", 0) + 1) % IDLE_SKIP
             if self._idle_skip:
                 return
         if self.demo or self.place:
@@ -1902,6 +1938,41 @@ class Controller(NSObject):
             self.mb_loop.setState_(1 if self.view.autoloop else 0)
 
 
+def _apply_app_identity(app) -> None:
+    """Give the running process VibeVoice's icon AND name in the Dock.
+
+    `CFBundleIconFile` / `CFBundleName` in the .app only apply when the *bundle*
+    is launched. The LaunchAgent runs `python3 vibevoice.py`, so the process
+    inherits the identity of Homebrew's `Python.app` — a rocket labelled
+    "Python" (sess.9757). Both halves need fixing and they need different fixes:
+
+    * the icon is a property of the running NSApplication → set the image;
+    * the name is read from the main bundle's info dictionary → patch that
+      dictionary. It is mutable in place, and this is the same approach the
+      menu-bar libraries use. It must happen before AppKit reads the name for
+      the Dock tile, so this runs early in `main()`.
+
+    A no-op for the real bundle, which already declares both. Cosmetic by
+    definition: any failure here must leave dictation untouched.
+    """
+    try:
+        icon = Path(__file__).resolve().parent / "assets" / "icon" / "VibeVoice_LED.icns"
+        if icon.exists():
+            image = NSImage.alloc().initWithContentsOfFile_(str(icon))
+            if image is not None:
+                app.setApplicationIconImage_(image)
+    except Exception:
+        pass
+    try:
+        bundle = NSBundle.mainBundle()
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = "VibeVoice"
+            info["CFBundleDisplayName"] = "VibeVoice"
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="VibeVoice — Dynamic Island STT pill (MIT)")
     ap.add_argument("--demo", action="store_true", help="animated demo to preview the design")
@@ -1916,9 +1987,14 @@ def main():
     app.setActivationPolicy_(
         NSApplicationActivationPolicyRegular if cfg.get("dock", True)
         else NSApplicationActivationPolicyAccessory)
+    _apply_app_identity(app)
     _CTRL = Controller.alloc().initWithDemo_place_(args.demo, args.place)
     _TIMER = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         TICK, _CTRL, "tick:", None, True)
+    # Zero tolerance: the run loop is otherwise free to coalesce this timer with
+    # other work, and a frame delivered late-then-early is judder even when the
+    # average rate is right. Cadence alone does not buy smoothness (sess.9757).
+    _TIMER.setTolerance_(0.0)
     NSApp.run()
 
 

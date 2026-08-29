@@ -160,9 +160,14 @@ because the code keeps "working" in the happy path.
 7. **`autosend.py` is one-shot.** After it fires one Return it disarms itself
    (`set_enabled(False)`). This prevents a "zombie ON" state from pressing Return while
    the user later types by hand. Do not make it persistent-by-default.
-8. **The master switch finds the engine by process name `engine.py`** (`pgrep -f` /
-   `pkill -f` in the pill). If you rename `engine.py`, you break start/stop/“is it
-   running” detection in `vibevoice.py`. Update all three call sites if you must rename.
+8. **The master switch finds the engine by its absolute path** — `pgrep -f` /
+   `pkill -f` in the pill match `str(ENGINE_PATH)`, i.e. the exact argv the pill
+   spawns, not the bare name. If you rename `engine.py`, you still break
+   start/stop/“is it running” detection in `vibevoice.py` (the path ends in that
+   name); update all three call sites if you must rename. Never widen the pattern
+   back to the bare name: `pgrep -f engine.py` matches any stranger carrying that
+   string in argv, and the `pkill` half then kills it (locked by
+   `tests/test_lifecycle.py`).
 9. **The three processes share no Python imports.** Coupling is via files only. Do not
    "simplify" by importing `engine` into `vibevoice` (or vice-versa) — it would couple
    their lifecycles and defeat the crash-isolation the file contract buys.
@@ -220,7 +225,8 @@ LaunchAgents: `com.vibevoice.pill.plist`, `com.vibevoice.autosend.plist`.
 | `VIBEVOICE_CLEANUP_TIMEOUT` | `2.5` | seconds before the cleanup call is abandoned (raw text pasted instead) |
 | `VIBEVOICE_CLEANUP_API_KEY` | *(unset)* | bearer key for the endpoint; falls back to `GROQ_API_KEY` |
 | `VIBEVOICE_STREAMING` | `1` | re-decode the **open** utterance while it is still being spoken and publish the stable prefix to `partial.txt`, so text exists before `SILENCE_SEC` expires. `0` restores the pure batch engine (no partial pass, no `partial.txt`) — locked by `test_streaming_off_behaves_exactly_like_the_legacy_engine` |
-| `VIBEVOICE_PARTIAL_INTERVAL` | `0.6` | minimum seconds between two streaming passes. Lower = fresher live text and more CPU; a pass that is still decoding when the next is due simply skips its turn. Headroom is real: a partial pass measured **~170 ms** on an M5 Max (whisper-turbo, MLX, 2–12 s buffers — the cost is flat because Whisper pads to its 30 s window anyway; measured 2026-08-02) |
+| `VIBEVOICE_PARTIAL_INTERVAL` | `0.6` | minimum seconds between two streaming passes **once text is flowing**. Lower = fresher live text and more CPU; a pass that is still decoding when the next is due simply skips its turn. Headroom is real: a partial pass measured **~170 ms** on an M5 Max (whisper-turbo, MLX, 2–12 s buffers — the cost is flat because Whisper pads to its 30 s window anyway; measured 2026-08-02) |
+| `VIBEVOICE_PARTIAL_WARMUP` | `0.45` | the same cadence **before the first word has reached the app**, where the whole wait lives: LocalAgreement-2 publishes nothing until two passes agree, so the first character costs `2 × cadence + one decode` and nothing else. Applied as a floor — it can only make the engine more eager, never less, so lowering `PARTIAL_INTERVAL` below it still wins. It ends on *delivered*, not on *confirmed*: the one-word lag puts those a full pass apart, and ending it on `confirmed` moved the draft earlier while moving the typed character **later** (1.4 s → 1.8 s, measured). Do **not** tune it below ~2× the decode cost — see the trap below |
 | `VIBEVOICE_STREAM_PASTE` | `1` | type each confirmed chunk into the frontmost app **as it is confirmed** (via `type_text`, direct unicode keystrokes — no clipboard), instead of pasting the whole sentence after the trailing silence. The final paste then adds only `unstreamed_tail()`. Safe only because the confirmed prefix never retracts. `0` restores the single atomic paste |
 | `VIBEVOICE_SILENCE` | `1.5` | trailing silence that closes an utterance. With `VIBEVOICE_STREAM_PASTE=1` this no longer gates the text reaching the app — only the last unconfirmed word or two wait for it |
 
@@ -262,8 +268,22 @@ still verified behaviorally. After any change, also exercise the path you touche
   the speech ended, it grew, it never retracted, the final text landed). This is what
   `pytest` cannot prove: the suite fakes `transcribe`, so it locks the wiring, not the
   behaviour. It is a tool and not a pytest because it needs the model on disk and takes
-  ~30 s. Baseline 2026-08-02, M5 Max: first word at **1.5 s** on a 10.3 s sentence,
-  ~10.5 s ahead of the final text, one update every ~0.65 s.
+  ~30 s. Baseline 2026-08-03, M5 Max, interleaved A/B over three runs a side:
+  first character in the app at **1.0–1.1 s** on a 10.3 s sentence (the flat-cadence
+  engine before it: 1.4 s, three times out of three), ~11 s ahead of the final text,
+  one update every ~0.65 s. Run it **interleaved** when comparing two settings —
+  back-to-back runs of one then the other measure the machine's load, not the change.
+
+  **Trap — a tighter warm-up cadence makes the first character LATER.** The obvious
+  optimisation is to decode much more often while the line is empty. Measured, it
+  loses: at 0.25 s the live first character went to 1.1–2.1 s against a rock-steady
+  1.4 s. Two reasons, both structural. The dispatch timer resets whether or not the
+  decode slot was free, so a cadence with less than ~2× the decode cost in slack
+  loses whole turns to jitter — and LocalAgreement needs *consecutive* hypotheses,
+  so a lost turn costs an entire agreement. And short buffers are where Whisper is
+  least trustworthy: 0.20 s of speech decodes to "E ba ba ba ba…", 0.35 s to
+  "Il Poltino". The recorded per-buffer answers live in `tests/test_contract.py`
+  (`_HEARD_AT`) so the scheduler can be reasoned about without the model on disk.
 - **Streaming / live text (live mic)** → `VIBEVOICE_AUTOSEND=0 python3 engine.py`, then in another
   shell `while :; do printf '\r%-90s' "$(cat ~/.vibevoice/partial.txt 2>/dev/null)"; sleep 0.2; done`
   and speak a long sentence **without stopping**. The draft must grow *while you talk*
@@ -399,12 +419,16 @@ These are deliberate trade-offs, documented so an agent doesn't "repair" them
 into a regression. Improve them only with a design that preserves the invariants
 in §3 — and update this section if you do.
 
-1. **Broad process match for start/stop.** The pill uses `pgrep -f engine.py` /
-   `pkill -f engine.py` (§3 invariant #8). This matches *any* process whose
-   command line contains `engine.py`, so it cannot distinguish two instances and
-   could touch an unrelated `engine.py`. It is the simplest reliable supervisor
-   for the single-user, single-instance design. If you make it PID-tracked,
-   preserve start / stop / "is it running" and keep the filename contract intact.
+1. **Process match for start/stop is by path, not by PID.** The pill matches
+   `pgrep -f "$ENGINE_PATH"` / `pkill -f "$ENGINE_PATH"` (§3 invariant #8). It
+   still cannot distinguish two instances launched from the *same* path — that
+   would need PID tracking, and the single-user design does not earn it. What it
+   no longer does is answer for strangers: the pattern used to be the bare
+   `engine.py`, which matched an editor open on the file, a `tail -f`, or another
+   project's `engine.py` entirely (reproduced 2026-08-06 — the pill saw a
+   stranger, refused to start its own engine, and `pkill` would have killed the
+   stranger). Anchoring cost nothing: no PID bookkeeping, the filename contract
+   intact. If you do make it PID-tracked, preserve start / stop / "is it running".
 2. **Clipboard is overwritten, not restored.** `engine.autosend()` `pbcopy`s the
    transcription and pastes it; the user's previous clipboard is lost. Restoring
    it is possible but races with fast successive dictations — left simple on

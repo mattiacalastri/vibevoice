@@ -5,7 +5,7 @@
 # the idle auto-lock so codesign can hit the private key 260× without re-prompting.
 # The partition-list (codesign: ACL) must already be set once (scar sess.9187).
 #
-#   cd ~/projects/vibevoice && bash packaging/sign_local.sh
+#   cd ~/projects/💼-prodotti/vibevoice && bash packaging/sign_local.sh
 #
 set -uo pipefail
 cd "$(dirname "$0")/.."

@@ -26,8 +26,19 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart on a CRASH, not on a deliberate quit. Plain `KeepAlive: true`
+         relaunches the pill whatever the exit code, which makes the menu's
+         "Quit (close everything)" a lie: NSApp.terminate_ exits 0, launchd
+         brings it straight back, and with VIBEVOICE_ENGINE_AUTOSTART=1 the
+         engine comes back with it. The user has no way to stop the app from
+         inside the app — the only cure is `launchctl bootout`, which nobody
+         should need to know. SuccessfulExit=false keeps the crash-restart
+         (exit != 0) and lets a clean quit stay quit. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>__HOME__/.vibevoice/pill.log</string>

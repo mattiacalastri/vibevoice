@@ -29,8 +29,15 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Crash-restart only (see the pill's plist for the full reasoning): a
+         Ctrl+C or a clean exit must stay dead. A missing pynput still exits 2,
+         so the "relaunches the corpse" case the README warns about keeps its
+         restart — that one IS a failure. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>__HOME__/.vibevoice/autosend.log</string>

@@ -171,7 +171,7 @@ SILERO_OFFSET = 0.35    # probability that turns it OFF (hysteresis low; in betw
 SILERO_FRAME = 512      # samples per Silero inference frame at 16 kHz (model contract)
 SILERO_CONTEXT = 64     # context samples prepended to each frame (v5 ONNX contract)
 SILERO_QUEUE_MAX = 32   # submit()→worker backlog cap; beyond this, blocks are dropped
-SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing silence that ends an utterance (lower = faster paste, but a mid-sentence pause splits the utterance)
+SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "0.8"))  # trailing silence that ends an utterance (lower = faster paste, but a mid-sentence pause splits the utterance)
 # Streaming (F3): re-decode the open utterance while it is still being spoken so
 # text exists BEFORE the trailing silence expires. Without it the first word can
 # only appear SILENCE_SEC after you stop talking — that wait is the architecture,
@@ -179,6 +179,53 @@ SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "1.5"))  # trailing sile
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
 PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
+PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.45"))  # cadence before the first word reaches the app
+
+
+def partial_interval(has_delivered: bool) -> float:
+    """Seconds the engine waits before the next streaming pass.
+
+    Two regimes, because the two are worth different things. Until the first
+    word is confirmed the user is staring at an empty line, and LocalAgreement-2
+    cannot publish anything before **two** passes have agreed — so the wait to
+    the first character is `2 × interval + one decode`, and nothing else. At a
+    flat 0.6 s that is 1.37 s in the scheduler model and measured **1.4 s** by
+    `tools/smoke_streaming.py`; on real dictation the ledger put the p50 at
+    2.31 s. That number is the whole gap between "it transcribes while you talk"
+    and "it transcribes after you stop".
+
+    The warm-up does NOT buy that back by decoding more often. Measured
+    2026-08-03 against the real model: at 0.25 s the first character got *worse*
+    and erratic on the live path (1.1–2.1 s over five runs, against a rock-steady
+    1.4 s), because a pass costs ~170 ms and the timer resets on dispatch whether
+    or not the slot was free — so a cadence with only 80 ms of slack loses whole
+    turns to decode jitter, and LocalAgreement needs *consecutive* hypotheses.
+    Short buffers are also where Whisper is least trustworthy: 0.20 s of speech
+    decodes to "E ba ba ba ba…", 0.35 s to "Il Poltino".
+
+    0.45 s is the setting that moves the first pass earlier while keeping the
+    pass count at two and leaving ~280 ms of slack. Interleaved A/B on the live
+    tool, n=3 a side: **1.4/1.4/1.4 s → 1.0/1.1/1.1 s**, no fidelity defects.
+    Once text is flowing the extra freshness is worth much less than the CPU and
+    the paste-queue pressure it creates, so the steady cadence resumes.
+
+    A floor and not a second cadence: the warm-up may only make the engine
+    *more* eager, never less. Someone who lowers `VIBEVOICE_PARTIAL_INTERVAL`
+    below the warm-up is asking for faster passes everywhere, and a warm-up that
+    then slowed the first word down would be the opposite of what it is for.
+
+    `has_delivered` means text reached the user, not text was confirmed — the
+    two are one pass apart because of the one-word lag, and getting it wrong
+    costs the whole feature. Measured 2026-08-03: ending the warm-up on the
+    first *confirmed* word moved the live draft earlier (1.4 s → 1.2 s) and the
+    first *typed* character LATER (1.4 s → 1.8 s), because the pass that would
+    have released that word had already dropped back to the steady cadence.
+    The number the user feels is the typed one.
+
+    Pure and synchronous: the audio thread calls this, and per invariant #6 it
+    may not block. `has_delivered` is a plain flag read, never a lock.
+    """
+    return PARTIAL_INTERVAL if has_delivered else min(PARTIAL_INTERVAL, PARTIAL_WARMUP)
 # Streaming paste: type each confirmed chunk into the frontmost app as it is
 # confirmed, instead of pasting the whole sentence after the trailing silence.
 # Safe only because the confirmed prefix never retracts. `0` restores the single
@@ -189,7 +236,7 @@ MAX_DUR = 15.0          # force finalize after this many seconds (short enough t
 PRE_ROLL_BLOCKS = 10    # blocks kept before speech onset — a DURATION (0.5s at
                         # BLOCKSIZE=800), and it is what saves the first syllable
 
-RETURN_DELAY = 1.5      # seconds between paste and Return keypress
+RETURN_DELAY = float(os.environ.get("VIBEVOICE_RETURN_DELAY", "0.7"))  # paste → Return
 
 
 # ── State file writers (engine is the sole writer) ───────────────────────────
@@ -251,6 +298,27 @@ def clear_partial() -> None:
         pass
 
 
+# The three JSONL ledgers below are read-modify-written: read every line, append
+# one, write the lot back capped. `write_text` truncates before it writes, so the
+# file is empty for the length of that write — and the pill kills the engine with
+# `pkill` on every restart and every engine-visible settings change. Landing in
+# that window truncates the ledger for good; corpus.jsonl is a learning corpus
+# that nothing can reconstruct. levels.bin and partial.txt were already written
+# tmp + os.replace 60 lines up — the durable files were the ones left exposed.
+#
+# The lock closes the second half of the same hole: up to two transcriptions are
+# in flight (invariant #4), and two workers doing read-modify-write on one file
+# lose an entry to each other regardless of how the write lands.
+_LEDGER_LOCK = threading.Lock()
+
+
+def _write_lines_atomic(path: Path, lines: list) -> None:
+    """Replace `path` with `lines` atomically. Caller holds _LEDGER_LOCK."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
 def _patch_last_metrics(fields: dict) -> None:
     """Merge `fields` into the newest metrics line.
 
@@ -261,13 +329,14 @@ def _patch_last_metrics(fields: dict) -> None:
     """
     try:
         import json
-        lines = METRICS_FILE.read_text().splitlines()
-        if not lines:
-            return
-        entry = json.loads(lines[-1])
-        entry.update(fields)
-        lines[-1] = json.dumps(entry)
-        METRICS_FILE.write_text("\n".join(lines) + "\n")
+        with _LEDGER_LOCK:
+            lines = METRICS_FILE.read_text().splitlines()
+            if not lines:
+                return
+            entry = json.loads(lines[-1])
+            entry.update(fields)
+            lines[-1] = json.dumps(entry)
+            _write_lines_atomic(METRICS_FILE, lines)
     except Exception:
         pass
 
@@ -322,13 +391,16 @@ def _append_history(text: str) -> None:
     try:
         import json
         import time
-        lines = []
-        try:
-            lines = HISTORY_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps({"ts": time.time(), "text": text}))
-        HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+        # Read and write under one lock: two workers that both read, then both
+        # write, keep only the second one's entry.
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = HISTORY_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps({"ts": time.time(), "text": text}))
+            _write_lines_atomic(HISTORY_FILE, lines[-HISTORY_MAX:])
     except Exception:
         pass
 
@@ -341,13 +413,14 @@ def _append_corpus(text: str) -> None:
     """
     try:
         import json
-        lines = []
-        try:
-            lines = CORPUS_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False))
-        CORPUS_FILE.write_text("\n".join(lines[-CORPUS_MAX:]) + "\n")
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = CORPUS_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False))
+            _write_lines_atomic(CORPUS_FILE, lines[-CORPUS_MAX:])
     except Exception:
         pass
 
@@ -361,13 +434,14 @@ def _append_metrics(entry: dict) -> None:
     """
     try:
         import json
-        lines = []
-        try:
-            lines = METRICS_FILE.read_text().splitlines()
-        except OSError:
-            pass
-        lines.append(json.dumps(entry))
-        METRICS_FILE.write_text("\n".join(lines[-METRICS_MAX:]) + "\n")
+        with _LEDGER_LOCK:
+            lines = []
+            try:
+                lines = METRICS_FILE.read_text().splitlines()
+            except OSError:
+                pass
+            lines.append(json.dumps(entry))
+            _write_lines_atomic(METRICS_FILE, lines[-METRICS_MAX:])
     except Exception:
         pass
 
@@ -861,6 +935,22 @@ def _press_key_cg(key_code: int, with_command: bool = False) -> bool:
 _TYPE_CHUNK = 16   # CGEventKeyboardSetUnicodeString is unreliable past ~20 UTF-16 units
 
 
+def paste_chunk(text: str) -> bool:
+    """Deliver `text` through the clipboard — the only channel Chromium honours.
+
+    Used for the STREAMING path on Electron apps. It costs the pasteboard (a
+    handful of overwrites per utterance), but the alternative measured worse:
+    unicode keystrokes are dropped there, so the words never arrived at all and
+    the engine still counted them as delivered.
+    """
+    import subprocess
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=3)
+    except Exception:
+        return False
+    return _press_key_cg(9, with_command=True)  # Cmd+V
+
+
 def type_text(text: str) -> bool:
     """Type `text` into the frontmost app as synthetic keystrokes.
 
@@ -871,6 +961,9 @@ def type_text(text: str) -> bool:
     characters directly, at the same HID tap as the Cmd+V path, so it reaches
     sandboxed Electron editors too. Returns False if Quartz is unavailable.
     """
+    if not stream_paste_supported():
+        return paste_chunk(text)
+
     if not text:
         return True
     try:
@@ -903,6 +996,48 @@ def type_text(text: str) -> bool:
 
 
 _ANCHOR_LEN = 3   # words of context that make a match trustworthy
+
+
+# ── Streaming-paste eligibility (Chromium/Electron drop unicode keystrokes) ───
+# `type_text` posts CGEventKeyboardSetUnicodeString with key code 0. AppKit apps
+# honour it; Chromium-based ones (Antigravity IDE, VS Code, Slack…) read the key
+# code and drop the payload. The engine still marked those words as streamed, so
+# the finalize paste only shipped the tail and the rest was lost in silence.
+# Where the stream cannot land, we skip it: the clipboard paste at finalize is
+# the one channel Chromium honours, and it then carries the whole utterance.
+STREAM_PASTE_DENY = tuple(
+    x.strip().lower()
+    for x in os.environ.get(
+        "VIBEVOICE_STREAM_PASTE_DENY",
+        "antigravity,vscode,electron,code,slack,discord,notion,obsidian,chrome",
+    ).split(",")
+    if x.strip()
+)
+_FRONT_CACHE = {"t": 0.0, "bid": ""}
+
+
+def frontmost_bundle_id() -> str:
+    """Bundle id of the frontmost app, cached for 1s (a partial pass runs often)."""
+    now = time.monotonic()
+    if now - _FRONT_CACHE["t"] < 1.0:
+        return _FRONT_CACHE["bid"]
+    bid = ""
+    try:
+        from AppKit import NSWorkspace
+        info = NSWorkspace.sharedWorkspace().activeApplication() or {}
+        bid = (info.get("NSApplicationBundleIdentifier") or "").lower()
+    except Exception:
+        bid = ""
+    _FRONT_CACHE.update(t=now, bid=bid)
+    return bid
+
+
+def stream_paste_supported() -> bool:
+    """False when the frontmost app is known to drop synthetic unicode keystrokes."""
+    bid = frontmost_bundle_id()
+    if not bid:
+        return True  # unknown app: keep the fast path, finalize still repairs
+    return not any(token in bid for token in STREAM_PASTE_DENY)
 
 
 def unstreamed_tail(streamed: str, final: str) -> str:
@@ -1487,6 +1622,12 @@ class Engine:
         self._streamed_by_gen: dict[int, str] = {}
         self._t_first_typed = 0.0             # when the first character of THIS utterance reached the app
         self._partials = 0                    # streaming passes run for THIS utterance
+        # Which cadence regime the audio thread is in (see partial_interval).
+        # A plain bool and not a look at `self._agree`, because the callback may
+        # not take _agree_lock: per invariant #6 the audio thread is allowed an
+        # attribute read and nothing else. Written by the partial worker, read
+        # by the callback — a lost update costs one pass of cadence, never text.
+        self._has_delivered = False
 
         # Mute edge-detector: write "idle" once when entering mute, not per block.
         self._was_muted = False
@@ -1622,7 +1763,8 @@ class Engine:
                     self._buf.append(block)
                     if now - self._t_start >= MAX_DUR:
                         do_finalize = "finalize"  # type: ignore[assignment]
-                    elif STREAMING and now - self._t_partial >= PARTIAL_INTERVAL:
+                    elif (STREAMING and now - self._t_partial
+                          >= partial_interval(self._has_delivered)):
                         # Due for a streaming pass. Snapshot the block LIST only
                         # (references, no audio copy) — the concatenate happens
                         # on the worker, never on the audio thread.
@@ -1650,6 +1792,9 @@ class Engine:
                     self._streamed = ""
                     self._t_first_typed = 0.0
                     self._partials = 0
+                    # A new utterance starts blind again: the warm-up cadence is
+                    # per-utterance, not per-session.
+                    self._has_delivered = False
                     # Seed this utterance's record with its own onset, so the
                     # KPI cannot later borrow the successor's.
                     self._utt_record(self._utt_gen)["start"] = self._t_start
@@ -1787,6 +1932,11 @@ class Engine:
                 self._utt_record(gen)["partials"] += 1
                 self._agree.update(text)
                 draft = self._agree.confirmed
+                # Leave the warm-up only once a word has actually come free for
+                # the app. The one-word lag holds the newest confirmed word
+                # back, so one confirmed word is still an empty screen.
+                if len(draft.split()) >= 2:
+                    self._has_delivered = True
                 # Claim the chunk under the same lock that produced it, so two
                 # passes can never type overlapping text.
                 to_type = ""
