@@ -38,7 +38,7 @@
 ## Quickstart
 
 1. Download **[`VibeVoice.dmg`](https://github.com/mattiacalastri/vibevoice/releases/latest)** and drag the app to Applications.
-2. First launch: **right-click → Open** (signed, not yet notarized — Gatekeeper asks once), then grant **Microphone** and **Accessibility** when macOS prompts.
+2. Double-click to launch — the app is signed and **notarized by Apple** — then grant **Microphone** and **Accessibility** when macOS prompts.
 3. Put your cursor anywhere — a terminal, an editor, a chat box — and **speak**.
 
 The pill lights up in the notch, the words appear *while you're still talking*,
@@ -109,8 +109,9 @@ is the one the tests now defend. See `tests/test_contract.py` for the receipts.
 ### Option 0 — download the app *(no toolchain needed)*
 
 Grab **[`VibeVoice.dmg`](https://github.com/mattiacalastri/vibevoice/releases/latest)**,
-drag to Applications, **right-click → Open** on first launch. The bundle is
-self-contained — it embeds Python and the MLX Whisper runtime.
+drag to Applications, double-click. Signed and notarized by Apple — no
+Gatekeeper warnings. The bundle is self-contained: it embeds Python and the
+MLX Whisper runtime.
 
 ### Option A — build the app from source
 
@@ -285,9 +286,8 @@ enough to matter, and instrumented so every claim can be checked.
 ## Roadmap
 
 **v1.0** ships the full loop: capture → live transcription → typed text →
-auto-Return, packaged as a signed, self-contained app. Next:
+auto-Return, packaged as a signed, notarized, self-contained app. Next:
 
-- [ ] Notarized DMG (no Gatekeeper right-click dance)
 - [ ] In-pill language switcher
 - [ ] Configurable theme (beyond Matrix green)
 - [ ] Demo GIF + short screencast
