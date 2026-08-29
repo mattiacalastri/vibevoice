@@ -33,6 +33,14 @@ find "$APP" \( -name "*.so" -o -name "*.dylib" -o -name "*.metallib" \) -print0 
 # Frameworks + embedded executables (python binary inside Resources, if any)
 find "$APP/Contents" -type f -perm +111 ! -name "*.py*" ! -name "*.so" ! -name "*.dylib" -print0 |
   xargs -0 -n 20 codesign --force --timestamp --options runtime --sign "$IDENTITY" 2>/dev/null || true
+# Python.framework's main dylib is named "Python" (no extension) and shipped
+# mode 644 — both finds above skip it, and the notary rejects the DMG for that
+# one file (submission a3e90245). Sign the versioned framework explicitly.
+for fw in "$APP"/Contents/Frameworks/*.framework; do
+  [ -d "$fw" ] || continue
+  ver="$(ls "$fw/Versions" 2>/dev/null | grep -v Current | head -1)"
+  [ -n "$ver" ] && codesign --force --timestamp --options runtime --sign "$IDENTITY" "$fw/Versions/$ver"
+done
 codesign --force --timestamp --options runtime \
   --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
 
