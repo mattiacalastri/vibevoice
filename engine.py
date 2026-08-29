@@ -178,8 +178,8 @@ SILENCE_SEC = float(os.environ.get("VIBEVOICE_SILENCE", "0.8"))  # trailing sile
 # not a tunable. The partial pass is a bonus: any failure leaves the final,
 # authoritative transcription untouched.
 STREAMING = os.environ.get("VIBEVOICE_STREAMING", "1") == "1"
-PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.22"))  # min seconds between partial passes
-PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.15"))  # cadence before the first word reaches the app
+PARTIAL_INTERVAL = float(os.environ.get("VIBEVOICE_PARTIAL_INTERVAL", "0.6"))  # min seconds between partial passes
+PARTIAL_WARMUP = float(os.environ.get("VIBEVOICE_PARTIAL_WARMUP", "0.45"))  # cadence before the first word reaches the app
 
 
 def partial_interval(has_delivered: bool) -> float:
