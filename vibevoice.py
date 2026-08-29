@@ -117,7 +117,7 @@ from AppKit import (
     NSStatusBar, NSMenuItem, NSVariableStatusItemLength,
     NSWindow, NSTextField, NSButton, NSPopUpButton, NSTextView, NSScrollView,
     NSVisualEffectView, NSWindowStyleMaskFullSizeContentView,
-    NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialMenu,
     NSVisualEffectStateFollowsWindowActiveState,
     NSAppearance, NSAppearanceNameDarkAqua,
 )
@@ -1501,8 +1501,17 @@ class Controller(NSObject):
         win.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
         glass = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
         glass.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        glass.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        # Menu, not HUDWindow. Measured on this desktop over a live dashboard —
+        # colour variance inside an empty strip of the window, which is exactly
+        # "how much of what is behind survives the glass":
+        #   menu 37.2 · popover 17.8 · sidebar 14.5 · HUDWindow 13.8
+        # HUDWindow, the obvious pick by name, is the most OPAQUE of the five: it
+        # renders as a flat dark panel and the effect reads as no effect at all.
+        # Menu is the dark smoked glass that actually refracts, and dark suits the
+        # Matrix chrome. Re-measure before changing this, do not pick by name.
+        glass.setMaterial_(NSVisualEffectMaterialMenu)
         glass.setState_(NSVisualEffectStateFollowsWindowActiveState)
+        glass.setEmphasized_(True)
         glass.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         win.setContentView_(glass)
         v = glass
