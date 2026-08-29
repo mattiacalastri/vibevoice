@@ -134,6 +134,14 @@ tests protect.
 
 ## Install
 
+### Option 0 — download the app (no toolchain needed)
+
+Grab **`VibeVoice.dmg`** from the [latest release](https://github.com/mattiacalastri/vibevoice/releases/latest),
+drag the app to Applications, then on first launch **right-click → Open** (the
+app is Developer ID–signed but not yet notarized, so Gatekeeper asks once).
+This bundle is self-contained: it embeds Python and the MLX Whisper runtime,
+no install steps beyond the Microphone and Accessibility prompts.
+
 ### Option A — build the app (recommended, all-in-one)
 
 Assemble a double-clickable `VibeVoice.app` and launch it. The bundle carries its
