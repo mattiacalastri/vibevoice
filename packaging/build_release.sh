@@ -26,6 +26,13 @@ echo "── graft: packages modulegraph cannot see ──"
 # position — regular packages always win over namespace portions.
 BUNDLE_LIB="$APP/Contents/Resources/lib/python3.10"
 zip -d "$APP/Contents/Resources/lib/python310.zip" 'tiktoken/*' 'mlx/*' >/dev/null 2>&1 || true
+# Purge EVERY Mach-O from the zip: CPython cannot dlopen an extension out of a
+# zipfile, so any .so/.dylib in there is inert weight — and the notary service
+# scans inside the zip, finds them unsigned (codesign cannot reach them), and
+# rejects the whole DMG with "Invalid" (measured: submission a7917e47, 8 issues,
+# all zip-internal binaries). The real llvmlite/objc binaries live grafted or
+# in lib-dynload, both signable.
+zip -d "$APP/Contents/Resources/lib/python310.zip" '*.so' '*.dylib' '*.so.dSYM/*' >/dev/null 2>&1 || true
 python3 - "$BUNDLE_LIB" <<'PYEOF'
 import importlib.util, os, shutil, sys
 bundle = sys.argv[1]
