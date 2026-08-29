@@ -99,3 +99,31 @@ def test_unknown_keys_dropped_known_kept(tmp_path, monkeypatch):
     cfg = config.load()
     assert cfg["lang"] == "en"
     assert "evil" not in cfg
+
+
+# ── settings i18n ─────────────────────────────────────────────────────────────
+
+def test_every_offered_language_can_actually_dress_the_window():
+    """A language in the picker with no strings behind it is a window with holes.
+
+    The picker and the translation table are two lists that must agree, and
+    nothing but this test makes them: adding a flag is one line, and the six
+    dictionaries it needs to grow are somewhere else in the file.
+    """
+    import vibevoice
+
+    reference = set(vibevoice._S_TEXT["en"])
+    for code, flag, name in vibevoice._S_LANGS:
+        assert code in vibevoice._S_TEXT, f"{name} is offered but has no strings"
+        assert set(vibevoice._S_TEXT[code]) == reference, (
+            f"{name} is missing {reference - set(vibevoice._S_TEXT[code])}"
+        )
+        assert flag and name, f"{code} has no flag or no name"
+
+
+def test_an_unknown_language_still_gets_a_readable_window():
+    """A hand-edited config can name a language the picker never offered. English
+    labels beat missing ones — the window must never come up blank."""
+    import vibevoice
+
+    assert vibevoice.settings_text("zz") == vibevoice._S_TEXT["en"]

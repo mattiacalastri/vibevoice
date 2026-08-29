@@ -67,13 +67,29 @@ win = ctrl._settings_win
 check("the window builds without raising", win is not None)
 
 if win is not None:
-    check("title", str(win.title()) == "VibeVoice — Settings", str(win.title()))
+    # The window speaks the language you dictate in, so the title is not a
+    # constant: it is whatever that language calls it.
+    T = vibevoice.settings_text(config.load()["lang"])
+    check("title follows the dictation language",
+          str(win.title()) == T["title"], str(win.title()))
     style = int(win.styleMask())
     check("resizable", bool(style & 8), f"styleMask={style}")
     frame = win.frame()
     check("height is sane", frame.size.height >= 300, f"h={frame.size.height:.0f}")
-    n = len(win.contentView().subviews())
-    check("subviews present (4 sections + 5 rows + Clear + history)", n >= 14, f"n={n}")
+    # Counted through the tree, not across the top: rows live inside their cards
+    # now, so a flat count of the content view sees 9 children and calls a fuller
+    # window emptier than the one it replaced.
+    def _deep_count(view):
+        subs = view.subviews() or []
+        return len(subs) + sum(_deep_count(s) for s in subs)
+
+    n = _deep_count(win.contentView())
+    check("views present (4 section labels + 3 cards + rows + Clear + history)",
+          n >= 20, f"n={n}")
+    cards = [s for s in win.contentView().subviews()
+             if s.layer() is not None and float(s.layer().cornerRadius()) > 0
+             and len(s.subviews() or []) >= 2]
+    check("settings are grouped into cards", len(cards) >= 3, f"cards={len(cards)}")
 
     for name in ("_set_lang", "_set_vp", "_set_as", "_set_ar", "_set_dk", "_set_hist"):
         check(f"control {name}", getattr(ctrl, name, None) is not None)
@@ -81,13 +97,14 @@ if win is not None:
     body = str(ctrl._set_hist.string())
     check("good lines survive the torn one",
           "first good line" in body and "second good line" in body)
-    check("a torn line did not blank the history", body.strip() != "(no transcriptions yet)")
+    check("a torn line did not blank the history", body.strip() != T["empty"])
     check("timestamp shown (HH:MM)", ":" in body.split()[0], repr(body.split("\n")[0][:30]))
     check("history timer armed", getattr(ctrl, "_hist_timer", None) is not None)
 
     # clearing
     ctrl.clearHistory_(None)
-    check("Clear empties the pane", str(ctrl._set_hist.string()).strip() == "(no transcriptions yet)")
+    check("Clear empties the pane",
+          str(ctrl._set_hist.string()).strip() == T["empty"], T["empty"])
     check("the file was truncated", hist.read_text() == "")
 
     # the vp checkbox must have an effect: turn it off and check it persists

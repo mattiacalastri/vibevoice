@@ -120,8 +120,9 @@ from AppKit import (
     NSVisualEffectBlendingModeBehindWindow, NSVisualEffectMaterialMenu,
     NSVisualEffectStateFollowsWindowActiveState,
     NSAppearance, NSAppearanceNameDarkAqua,
+    NSSwitch, NSKernAttributeName, NSViewMinXMargin, NSViewMinYMargin,
 )
-from Foundation import NSObject, NSMakeSize, NSBundle
+from Foundation import NSObject, NSMakeSize, NSBundle, NSAttributedString
 
 # ── state-file contract (under $HOME/.vibevoice) ──────────────────────────────
 STATE_DIR  = Path(os.path.expanduser("~/.vibevoice"))
@@ -1004,6 +1005,122 @@ def format_history_line(record) -> str | None:
         return text
 
 
+# ── settings i18n ─────────────────────────────────────────────────────────────
+# The six languages the picker offers. The CODE is what reaches Whisper and the
+# engine; the flag is decoration and the name is what carries the meaning, which
+# is why they always travel together — a flag alone would claim that a language
+# belongs to a country, and "English" is not a British possession. Emoji flags
+# are safe here and nowhere else: this app is macOS-only, so Apple Color Emoji
+# is guaranteed to be present and to render them identically on every machine.
+_S_LANGS = [
+    ("it", "🇮🇹", "Italiano"),
+    ("en", "🇬🇧", "English"),
+    ("es", "🇪🇸", "Español"),
+    ("fr", "🇫🇷", "Français"),
+    ("de", "🇩🇪", "Deutsch"),
+    ("pt", "🇵🇹", "Português"),
+]
+
+# Every string the settings window shows, in each of those languages. The window
+# speaks whatever language you dictate in: someone who talks to the app in
+# Spanish should not have to read English to change a switch. Subtitles are
+# written in plain words on purpose — they say what the option DOES to your
+# machine, not what it is called in the code.
+_S_TEXT = {
+    "it": {
+        "title": "VibeVoice — Impostazioni",
+        "voice": "Voce", "behaviour": "Comportamento",
+        "appearance": "Aspetto", "history": "Cronologia",
+        "clear": "Svuota", "empty": "(nessuna trascrizione)",
+        "lang": ("Lingua", "La lingua in cui parli quando detti"),
+        "vp": ("Elaborazione voce", "Toglie l'eco e i rumori intorno a te"),
+        "as": ("Incolla automatico",
+               "Scrive il testo dove hai il cursore, senza copiare e incollare"),
+        "ar": ("Invio automatico",
+               "Preme Invio da solo appena il testo è arrivato"),
+        "dk": ("Icona nel Dock",
+               "Mostra VibeVoice in fondo allo schermo, tra le app aperte"),
+    },
+    "en": {
+        "title": "VibeVoice — Settings",
+        "voice": "Voice", "behaviour": "Behaviour",
+        "appearance": "Appearance", "history": "History",
+        "clear": "Clear", "empty": "(no transcriptions yet)",
+        "lang": ("Language", "The language you speak when you dictate"),
+        "vp": ("Voice processing", "Removes echo and the noise around you"),
+        "as": ("Auto-paste",
+               "Types the text where your cursor is, no copy and paste"),
+        "ar": ("Auto-Return",
+               "Presses Return for you as soon as the text has landed"),
+        "dk": ("Dock icon",
+               "Shows VibeVoice at the bottom of the screen, with the open apps"),
+    },
+    "es": {
+        "title": "VibeVoice — Ajustes",
+        "voice": "Voz", "behaviour": "Comportamiento",
+        "appearance": "Apariencia", "history": "Historial",
+        "clear": "Vaciar", "empty": "(todavía no hay transcripciones)",
+        "lang": ("Idioma", "El idioma en el que hablas al dictar"),
+        "vp": ("Procesamiento de voz", "Quita el eco y el ruido a tu alrededor"),
+        "as": ("Pegado automático",
+               "Escribe el texto donde está el cursor, sin copiar y pegar"),
+        "ar": ("Intro automático",
+               "Pulsa Intro por ti en cuanto llega el texto"),
+        "dk": ("Icono en el Dock",
+               "Muestra VibeVoice abajo, entre las apps abiertas"),
+    },
+    "fr": {
+        "title": "VibeVoice — Réglages",
+        "voice": "Voix", "behaviour": "Comportement",
+        "appearance": "Apparence", "history": "Historique",
+        "clear": "Effacer", "empty": "(aucune transcription)",
+        "lang": ("Langue", "La langue que vous parlez quand vous dictez"),
+        "vp": ("Traitement de la voix", "Supprime l'écho et les bruits autour de vous"),
+        "as": ("Collage automatique",
+               "Écrit le texte là où se trouve le curseur, sans copier-coller"),
+        "ar": ("Retour automatique",
+               "Appuie sur Entrée dès que le texte est arrivé"),
+        "dk": ("Icône du Dock",
+               "Affiche VibeVoice en bas de l'écran, parmi les apps ouvertes"),
+    },
+    "de": {
+        "title": "VibeVoice — Einstellungen",
+        "voice": "Stimme", "behaviour": "Verhalten",
+        "appearance": "Darstellung", "history": "Verlauf",
+        "clear": "Leeren", "empty": "(noch keine Transkriptionen)",
+        "lang": ("Sprache", "Die Sprache, in der du diktierst"),
+        "vp": ("Sprachverarbeitung", "Entfernt Echo und Geräusche um dich herum"),
+        "as": ("Automatisch einfügen",
+               "Schreibt den Text dorthin, wo dein Cursor steht"),
+        "ar": ("Automatische Eingabe",
+               "Drückt für dich die Eingabetaste, sobald der Text da ist"),
+        "dk": ("Dock-Symbol",
+               "Zeigt VibeVoice unten am Bildschirm bei den offenen Apps"),
+    },
+    "pt": {
+        "title": "VibeVoice — Definições",
+        "voice": "Voz", "behaviour": "Comportamento",
+        "appearance": "Aparência", "history": "Histórico",
+        "clear": "Limpar", "empty": "(ainda sem transcrições)",
+        "lang": ("Idioma", "O idioma em que falas quando ditas"),
+        "vp": ("Processamento de voz", "Remove o eco e o ruído à tua volta"),
+        "as": ("Colar automático",
+               "Escreve o texto onde está o cursor, sem copiar e colar"),
+        "ar": ("Enter automático",
+               "Carrega em Enter por ti assim que o texto chega"),
+        "dk": ("Ícone na Dock",
+               "Mostra o VibeVoice em baixo, entre as apps abertas"),
+    },
+}
+
+
+def settings_text(lang: str) -> dict:
+    """The strings for `lang`, falling back to English for anything unknown.
+    A language the picker does not offer can still reach here from a hand-edited
+    config, and a window with missing labels is worse than one in English."""
+    return _S_TEXT.get(lang, _S_TEXT["en"])
+
+
 def apply_settings(cfg: dict) -> bool:
     """Persist `cfg`, apply the Dock policy, and say whether the engine must restart.
 
@@ -1460,8 +1577,92 @@ class Controller(NSObject):
             )
 
     _SET_W = 460            # settings window width
-    _SET_MIN_H = 300        # floor for the resizable height
     _SET_HISTORY_TICK = 2.0  # history refresh cadence, only while on screen
+
+    # ── settings window: layout constants (8pt rhythm) ───────────────────────
+    _S_PAD      = 22        # window margin
+    _S_TOP      = 62        # first section clears the transparent titlebar
+    _S_ROW      = 36        # row with a title only
+    _S_ROW_SUB  = 50        # row that also carries a subtitle
+    _S_HEAD     = 28        # section header + its gap to the card
+    _S_GAP      = 20        # card to the next section header
+    _S_HIST     = 168       # history card
+    _S_RADIUS   = 10.0
+
+    def _s_section(self, parent, title, y):
+        """Small-caps section label. Tracked, quiet, tertiary — a section label
+        is signage, not a headline: the eye should find it and move on."""
+        lbl = NSTextField.labelWithString_("")
+        lbl.setAttributedStringValue_(NSAttributedString.alloc()
+            .initWithString_attributes_(title.upper(), {
+                NSFontAttributeName: NSFont.systemFontOfSize_weight_(10.0, 0.3),
+                NSKernAttributeName: 1.1,
+                NSForegroundColorAttributeName:
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(0.12, 1.0, 0.32, 0.72),
+            }))
+        lbl.setFrame_(NSMakeRect(self._S_PAD + 2, y, self._SET_W - 2 * self._S_PAD, 14))
+        lbl.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+        parent.addSubview_(lbl)
+
+    def _s_card(self, parent, y, h):
+        """A translucent card, never an opaque one: an opaque panel would cover
+        the glass the window is made of and put us back where we started."""
+        card = NSView.alloc().initWithFrame_(
+            NSMakeRect(self._S_PAD, y, self._SET_W - 2 * self._S_PAD, h))
+        card.setWantsLayer_(True)
+        card.layer().setCornerRadius_(self._S_RADIUS)
+        card.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.055).CGColor())
+        card.layer().setBorderWidth_(1.0)
+        card.layer().setBorderColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.085).CGColor())
+        card.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+        parent.addSubview_(card)
+        return card
+
+    def _s_divider(self, card, y):
+        """Hairline inset from both edges, the way grouped rows separate on this
+        platform — a full-bleed line reads as a cut, an inset one as a seam."""
+        d = NSView.alloc().initWithFrame_(
+            NSMakeRect(14, y, card.frame().size.width - 28, 1))
+        d.setWantsLayer_(True)
+        d.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.07).CGColor())
+        d.setAutoresizingMask_(NSViewWidthSizable)
+        card.addSubview_(d)
+
+    def _s_row(self, card, title, subtitle, y, h):
+        """One setting per row: title, and the explanation UNDER it in muted type.
+        The old form said everything twice — "Auto-paste" beside "paste the
+        transcription" — because the caption was the checkbox's own label. The
+        control carries no words now, so the sentence is free to be useful."""
+        w = card.frame().size.width
+        t = NSTextField.labelWithString_(title)
+        t.setFont_(NSFont.systemFontOfSize_(13.0))
+        t.setTextColor_(NSColor.labelColor())
+        t.setFrame_(NSMakeRect(14, y + h - (24 if subtitle else 26), w - 100, 18))
+        t.setAutoresizingMask_(NSViewWidthSizable)
+        card.addSubview_(t)
+        if subtitle:
+            s = NSTextField.labelWithString_(subtitle)
+            s.setFont_(NSFont.systemFontOfSize_(11.0))
+            s.setTextColor_(NSColor.secondaryLabelColor())
+            s.setFrame_(NSMakeRect(14, y + h - 42, w - 100, 16))
+            s.setAutoresizingMask_(NSViewWidthSizable)
+            card.addSubview_(s)
+
+    def _s_switch(self, card, on, y, h):
+        """NSSwitch, not a checkbox. Same state API the tests already drive, but
+        a checkbox reads as a form to fill in and a switch reads as a setting
+        that is on — which is what every one of these actually is."""
+        sw = NSSwitch.alloc().initWithFrame_(
+            NSMakeRect(card.frame().size.width - 52, y + (h - 22) / 2.0, 38, 22))
+        sw.setState_(1 if on else 0)
+        sw.setTarget_(self)
+        sw.setAction_("settingsChanged:")
+        sw.setAutoresizingMask_(NSViewMinXMargin)
+        card.addSubview_(sw)
+        return sw
 
     def openSettings_(self, _sender):
         if getattr(self, "_settings_win", None):
@@ -1472,29 +1673,43 @@ class Controller(NSObject):
 
         cfg = config.load()
         W = self._SET_W
-        # Rows are laid out by a cursor walking down from the top instead of the
-        # hand-computed constants this used to carry (H-50, H-85, H-115, ...), where
-        # inserting one row meant recomputing every row below it.
-        rows = [("section", "VOICE"), ("lang", None), ("vp", None),
-                ("section", "BEHAVIOUR"), ("autosend", None), ("autosend_return", None),
-                ("section", "APPEARANCE"), ("dock", None),
-                ("section", "HISTORY")]
-        H = 64 + 26 * sum(1 for k, _ in rows if k != "section") \
-            + 30 * sum(1 for k, _ in rows if k == "section") + 160
+        # The layout is declared, then measured, then drawn. Height used to be a
+        # sum of magic numbers; now the same list that draws the window is the one
+        # that sizes it, so a new row cannot silently overflow the frame.
+        T = settings_text(cfg["lang"])
+        self._s_empty = T["empty"]
+        self._s_lang_code = cfg["lang"]
+        SECTIONS = [
+            (T["voice"], [T["lang"] + ("lang",), T["vp"] + ("vp",)]),
+            (T["behaviour"], [T["as"] + ("as",), T["ar"] + ("ar",)]),
+            (T["appearance"], [T["dk"] + ("dk",)]),
+        ]
+
+        def card_h(rows):
+            return sum(self._S_ROW_SUB if sub else self._S_ROW for _, sub, _ in rows) \
+                + (len(rows) - 1)          # hairlines
+
+        # Measure with the SAME step the drawing loop walks. They used to be two
+        # arithmetics for one layout — the window came out 52pt taller than its
+        # content and the surplus showed as dead space under the history.
+        step = self._S_HEAD + self._S_GAP - 8      # card bottom -> next card top
+        H = self._S_TOP + self._S_HIST + self._S_PAD
+        for _, rows in SECTIONS:
+            H += card_h(rows) + step
 
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H),
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
             | NSWindowStyleMaskFullSizeContentView,
             NSBackingStoreBuffered, False)
-        win.setTitle_("VibeVoice — Settings")
-        win.setMinSize_(NSMakeSize(W, self._SET_MIN_H))
+        win.setTitle_(T["title"])
+        win.setMinSize_(NSMakeSize(W, H))   # sotto il contenuto non si scende
         win.center()
         win.setReleasedWhenClosed_(False)
         # Liquid glass: the window IS the material. Behind-window vibrancy under a
-        # transparent titlebar; controls sit on the glass, the history keeps its own
-        # opaque-ish layer below (a dense reading surface must not be glass). The
-        # "Reduce transparency" fallback is the system's own: NSVisualEffectView
+        # transparent titlebar; the cards above it are translucent too, so the
+        # material reads through the whole surface instead of being covered by it.
+        # The "Reduce transparency" fallback is the system's own: NSVisualEffectView
         # goes opaque by itself. Dark is pinned on purpose — this is the Matrix
         # pill's chrome, one committed look, no light-mode contrast roulette.
         win.setTitlebarAppearsTransparent_(True)
@@ -1512,88 +1727,79 @@ class Controller(NSObject):
         glass.setMaterial_(NSVisualEffectMaterialMenu)
         glass.setState_(NSVisualEffectStateFollowsWindowActiveState)
         glass.setEmphasized_(True)
-        glass.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         win.setContentView_(glass)
         v = glass
-        y = [H - 36]                       # a cell, so the closures below can move it
-        # (content now extends under the titlebar: start 24pt lower to clear it)
 
-        def _section(title):
-            y[0] -= 30
-            lbl = NSTextField.labelWithString_(title)
-            lbl.setFrame_(NSMakeRect(20, y[0], W - 40, 18))
-            lbl.setFont_(NSFont.boldSystemFontOfSize_(10))
-            # The one color the glass carries: the pill's own Matrix green (§MATRIX),
-            # dimmed to a label. Everything else stays semantic/vibrant.
-            lbl.setTextColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.12, 1.0, 0.32, 0.85))
-            v.addSubview_(lbl)
+        made = {}
+        y = H - self._S_TOP
+        for title, rows in SECTIONS:
+            self._s_section(v, title, y + 8)
+            ch = card_h(rows)
+            y -= ch
+            card = self._s_card(v, y, ch)
+            ry = ch                          # walk down inside the card
+            for i, (label, sub, key) in enumerate(rows):
+                h = self._S_ROW_SUB if sub else self._S_ROW
+                ry -= h
+                self._s_row(card, label, sub, ry, h)
+                if key == "lang":
+                    pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                        NSMakeRect(card.frame().size.width - 170, ry + (h - 24) / 2.0,
+                                   156, 24), False)
+                    pop.addItemsWithTitles_(
+                        [f"{flag}  {name}" for _, flag, name in _S_LANGS])
+                    codes = [c for c, _, _ in _S_LANGS]
+                    pop.selectItemAtIndex_(
+                        codes.index(cfg["lang"]) if cfg["lang"] in codes else 0)
+                    pop.setTarget_(self)
+                    pop.setAction_("settingsChanged:")
+                    pop.setAutoresizingMask_(NSViewMinXMargin)
+                    card.addSubview_(pop)
+                    made[key] = pop
+                else:
+                    made[key] = self._s_switch(card, cfg[{"vp":"vp","as":"autosend","ar":"autosend_return","dk":"dock"}[key]], ry, h)
+                if i < len(rows) - 1:
+                    ry -= 1
+                    self._s_divider(card, ry)
+            y -= step
 
-        def _row(label):
-            y[0] -= 26
-            lbl = NSTextField.labelWithString_(label)
-            lbl.setFrame_(NSMakeRect(20, y[0], 160, 20))
-            v.addSubview_(lbl)
-            return y[0]
-
-        def _check(label, caption, on):
-            top = _row(label)
-            b = NSButton.buttonWithTitle_target_action_(caption, self, "settingsChanged:")
-            b.setButtonType_(3)            # NSButtonTypeSwitch (checkbox)
-            b.setFrame_(NSMakeRect(190, top, W - 210, 20))
-            b.setState_(1 if on else 0)
-            v.addSubview_(b)
-            return b
-
-        _section("VOICE")
-        top = _row("Language")
-        self._set_lang = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(188, top - 3, 120, 26), False)
-        self._set_lang.addItemsWithTitles_(["it", "en"])
-        self._set_lang.selectItemWithTitle_(cfg["lang"])
-        self._set_lang.setTarget_(self)
-        self._set_lang.setAction_("settingsChanged:")
-        v.addSubview_(self._set_lang)
-        # The engine has always read VIBEVOICE_VP; until now nothing could set it.
-        self._set_vp = _check("Voice processing", "echo + noise cancellation", cfg["vp"])
-
-        _section("BEHAVIOUR")
-        self._set_as = _check("Auto-paste", "paste the transcription", cfg["autosend"])
-        self._set_ar = _check("Auto-Return", "press Return after pasting",
-                              cfg["autosend_return"])
-
-        _section("APPEARANCE")
-        self._set_dk = _check("Dock icon", "show in Dock", cfg["dock"])
-
-        _section("HISTORY")
-        clear = NSButton.buttonWithTitle_target_action_("Clear", self, "clearHistory:")
-        clear.setFrame_(NSMakeRect(W - 90, y[0] - 2, 70, 22))
-        clear.setAutoresizingMask_(1)      # NSViewMinXMargin: stay glued to the right
+        # History: the one surface that is content, not chrome. Its own darker
+        # berth and full-contrast type, because dense text must be read, not
+        # admired through glass.
+        self._s_section(v, T["history"], y + 8)
+        clear = NSButton.buttonWithTitle_target_action_(T["clear"], self, "clearHistory:")
+        clear.setFont_(NSFont.systemFontOfSize_(11.0))
+        clear.setBezelStyle_(1)              # NSBezelStyleRounded
+        clear.setFrame_(NSMakeRect(W - self._S_PAD - 62, y + 2, 62, 20))
+        clear.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
         v.addSubview_(clear)
 
-        y[0] -= 8
-        hist_h = max(110, y[0] - 20)
+        y -= self._S_HIST
         sc = NSScrollView.alloc().initWithFrame_(
-            NSMakeRect(20, y[0] - hist_h, W - 40, hist_h))
-        tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, hist_h))
+            NSMakeRect(self._S_PAD, y, W - 2 * self._S_PAD, self._S_HIST))
+        tv = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, W - 2 * self._S_PAD, self._S_HIST))
         tv.setEditable_(False)
-        # Content layer, not glass: dense text gets a dim solid berth and full-
-        # contrast type, per the material's own rulebook.
-        sc.setBorderType_(0)               # NSNoBorder
+        sc.setBorderType_(0)                 # NSNoBorder
         sc.setDrawsBackground_(False)
         sc.setWantsLayer_(True)
-        sc.layer().setCornerRadius_(10.0)
+        sc.layer().setCornerRadius_(self._S_RADIUS)
         sc.layer().setMasksToBounds_(True)
         tv.setDrawsBackground_(True)
-        tv.setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.35))
+        tv.setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.30))
         tv.setTextColor_(NSColor.labelColor())
-        tv.setTextContainerInset_(NSMakeSize(8, 8))
+        tv.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(11.0, 0.0))
+        tv.setTextContainerInset_(NSMakeSize(10, 10))
         sc.setDocumentView_(tv)
         sc.setHasVerticalScroller_(True)
-        # The history is the only thing worth growing when the window is resized.
         sc.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         v.addSubview_(sc)
 
+        self._set_lang = made["lang"]
+        self._set_vp = made["vp"]
+        self._set_as = made["as"]
+        self._set_ar = made["ar"]
+        self._set_dk = made["dk"]
         self._set_hist = tv
         self._settings_win = win
         self._reload_history()
@@ -1657,21 +1863,46 @@ class Controller(NSObject):
             shown = format_history_line(record)
             if shown:
                 rows.append(shown)
-        self._set_hist.setString_("\n".join(rows) if rows else "(no transcriptions yet)")
+        self._set_hist.setString_("\n".join(rows) if rows else
+                                  getattr(self, "_s_empty", "(no transcriptions yet)"))
 
     def settingsChanged_(self, _sender):
         # Pure wiring: read the controls, hand them to apply_settings, obey the answer.
         # The decision deliberately does NOT live here — a selector cannot be driven
         # from a test (PyObjC demands a real Objective-C `self`), and this is precisely
         # where the "restart the engine for every change" defect hid unnoticed.
-        if apply_settings({
-            "lang": str(self._set_lang.titleOfSelectedItem()),
+        lang = _S_LANGS[max(0, int(self._set_lang.indexOfSelectedItem()))][0]
+        restart = apply_settings({
+            "lang": lang,
             "autosend": bool(self._set_as.state()),
             "autosend_return": bool(self._set_ar.state()),
             "dock": bool(self._set_dk.state()),
             "vp": bool(self._set_vp.state()),
-        }):
+        })
+        if lang != getattr(self, "_s_lang_code", lang):
+            # The window is written in the language you dictate in, so changing
+            # that language has to rewrite the window. Rebuilt rather than
+            # relabelled: every row would otherwise need a handle kept alive
+            # purely to be renamed once in a while.
+            self._rebuild_settings()
+        if restart:
             self.restartEngine_(None)
+
+    def _rebuild_settings(self):
+        win = getattr(self, "_settings_win", None)
+        if win is None:
+            return
+        self._stop_history_timer()
+        frame = win.frame()
+        win.orderOut_(None)
+        self._settings_win = None
+        self.openSettings_(None)
+        new_win = getattr(self, "_settings_win", None)
+        if new_win is not None:
+            # Keep the corner where the user left it; the height is the layout's
+            # to decide, and it can differ between languages.
+            new_win.setFrameTopLeftPoint_(
+                NSMakePoint(frame.origin.x, frame.origin.y + frame.size.height))
 
     def quitAll_(self, sender):
         _stop_engine()
